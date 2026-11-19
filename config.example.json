@@ -1,0 +1,36 @@
+{
+  "project_id": null,
+  "group_id": "cidz5AzUggugocUxkWQwScIQA==",
+  "group_name": "AI联调测试",
+  "workbook": "C:/local/AI调试信息.xlsx",
+  "dws_path": "C:/replace-with-your-native-dws.exe",
+  "codex_path": "C:/replace-with-your-native-codex.exe",
+  "profile": "REPLACE_WITH_YOUR_CORP_ID:YOUR_USER_ID",
+  "model": "gpt-6-sol",
+  "max_steps": 6,
+  "agent_timeout_seconds": 75,
+  "task_timeout_seconds": 900,
+  "send_authorized": false,
+  "peers": [
+    {
+      "id": "A",
+      "name": "联调-AI-唱荣标",
+      "bot_id": "yg2KpLMKmY6ortoRByPIfA==",
+      "owner_member_id": "$:LWCP_v1:$ejJxSWoBTL/ouRlIA69fSJ/1tfzQNUTP",
+      "sender_id": "DEiP5TplZR3RBl9iSukusIKD2ZQiPj7HD09f",
+      "owner_id": "DEiP5TplZR3RBajfRqVAAD5vl63YdcXqSZ",
+      "workdir": "C:/replace-with-A-project",
+      "role": "负责A端项目，根据只读项目资料确认接口定义并与同伴核对。"
+    },
+    {
+      "id": "B",
+      "name": "联调-AI-吕天明",
+      "bot_id": "zftWZgz08tu3WGJ3nv/eag==",
+      "owner_member_id": "$:LWCP_v1:$dfjf0Q3MPjfimy8uXzxj1E2XiyIEbD2n",
+      "sender_id": "DEiP5TplZR3RBl9iSukusIKD4E5ETsyYD1e",
+      "owner_id": "DEiP5TplZR3RB1nAPSEyZeggrZUTTnjIJR",
+      "workdir": "C:/replace-with-B-project",
+      "role": "负责B端项目，根据只读项目资料确认接口定义并与同伴核对。"
+    }
+  ]
+}

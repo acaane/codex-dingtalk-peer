@@ -1,0 +1,29 @@
+新部署会自动检测可唯一确定的项目和邻近业务目录，并建立项目专用协调会话，不必另外打开AI窗口登记。已有会话绑定优先复用；多个候选、本人Webhook或无法确定的目录仍按提示补充。首次模型检查使用账号默认模型，超时会说明网络/代理和登录检查方法。创建回执不明保留进度，不重复建会话。
+
+通用连接器：首次接入说明（可交给本机业务或协调agent执行）
+
+所有同事使用同一个包，不另建机器人或复制另一套程序。你可在当前业务agent窗口兼任本机协调，读取README.md与docs/coordinator-start.txt。
+
+1. 把完整Windows包解压到独立工具目录，再双击start.cmd。源码包也可运行，但缺少环境组件时需要联网下载。
+2. 程序会优先复用本机Python/DWS/Codex与本人登录，识别本人在群中的账号、现有机器人及已保存配置。多个登录身份或对端不能唯一确定时，按实际列表选择；不会默认取第一个，也不按名字授权。
+3. 只有缺少的信息才需补充：本次共享项目标识、本机业务目录、本人Webhook或已有Excel路径。Webhook隐藏输入并按Windows用户加密，不能发群或打进包。本人的首次DWS/Codex登录由本人完成，已有登录直接复用。接入校验只证明机器人通信身份，不证明业务联调通过。
+4. agent可使用install.ps1 -ToolsOnly准备环境，然后使用检测出的Python运行setup_helper.py discover --partner <已有对端机器人名称> --project-id <约定标识>；之后setup_helper.py configure --peer <自动检测出的本人端ID> --project <本机业务目录> --project-id <约定标识>。端ID可以由机器人稳定ID自动生成，不要固定写成A/B/C。
+5. 出现ready后，在当前主协调agent自身环境执行setup_helper.py register-agent，程序自动读取CODEX_THREAD_ID登记本会话，不需人工抄UUID。没有可用会话入口时回报实际工具和所缺信息；不要登记临时子会话代替主窗口。
+6. 回报连接器目录、自动检测出的本人端ID、项目标识、业务目录、程序入口及已登记状态，等待主协调端派单。
+
+业务接口、服务端地址/端口、完成标准及停止时间由本轮任务提供。首次接入不自动启动真实业务设备、不写PLC。业务修改按本机用户授权由本机负责人处理；连接器问题交连接器维护方。
+
+使用 sub2api 的 Codex CLI
+
+请在本机 Codex 用户级 config.toml 配置。通常是 %USERPROFILE%\.codex\config.toml，设置了 CODEX_HOME 时使用该目录中的 config.toml。保留原来可用的模型名和其他设置。把 model_provider 放在第一个 TOML 表之前，provider 节合并到已有同名表中。
+
+    model_provider = "sub2api"
+
+    [model_providers.sub2api]
+    name = "sub2api"
+    wire_api = "responses"
+    requires_openai_auth = false
+    base_url = "http://SUB2API_HOST:8080/v1"
+    experimental_bearer_token = "REPLACE_WITH_YOUR_ASSIGNED_TOKEN"
+
+把地址占位符替换为本单位分配的网关地址。由本人在本机填自己的网关令牌；已有 env_key 等可用凭据配置可继续使用。连接器复用 Codex 的配置，API 凭据留在 Codex 的本机配置或凭据来源中。首次继续运行 start.cmd；已完成接入、改用网关时先正常停止连接器，执行 check.cmd，检查通过后再运行 start.cmd。钉钉授权和 Webhook 仍按原步骤办理。

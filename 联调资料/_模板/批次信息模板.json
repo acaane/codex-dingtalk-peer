@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "project_id": "",
+  "project_name": "",
+  "module_id": "",
+  "module_name": "",
+  "batch_id": "",
+  "started_on": "YYYY-MM-DD",
+  "ended_on": null,
+  "status": "in_progress",
+  "validation_scope": "",
+  "interface_baseline": {"name": "", "sha256": ""},
+  "simulated_dependencies": [],
+  "participants": [],
+  "business_workspaces": [],
+  "coordination_route_reference": "",
+  "deferred_or_excluded": [],
+  "formal_report": "00_联调记录与总结.docx",
+  "evidence_directory": "03_证据",
+  "inventory": "06_整理索引/文件清单.json",
+  "previous_batch": null
+}

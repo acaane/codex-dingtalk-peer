@@ -1,0 +1,22 @@
+{
+  "group_id": "REPLACE_WITH_AGREED_GROUP_CONVERSATION_ID",
+  "project_id": "qinzhou-java-integration",
+  "peers": [
+    {
+      "id": "A",
+      "name": "REPLACE_WITH_CONTROL_ROBOT_NAME",
+      "owner_name": "REPLACE_WITH_CONTROL_OWNER_NAME",
+      "bot_id": "REPLACE_WITH_CONTROL_OPEN_BOT_ID",
+      "owner_member_id": "REPLACE_WITH_CONTROL_MEMBER_DINGTALK_ID",
+      "role": "负责控制程序、原运行实例、设备条件和控制侧验证"
+    },
+    {
+      "id": "B",
+      "name": "REPLACE_WITH_JAVA_ROBOT_NAME",
+      "owner_name": "REPLACE_WITH_JAVA_OWNER_NAME",
+      "bot_id": "REPLACE_WITH_JAVA_OPEN_BOT_ID",
+      "owner_member_id": "REPLACE_WITH_JAVA_MEMBER_DINGTALK_ID",
+      "role": "负责Java后端部署、业务输入、事件持久消费和前端结果核对"
+    }
+  ]
+}
