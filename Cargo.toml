@@ -1,0 +1,12 @@
+[package]
+name = "codex-dingtalk-peer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+gpui-kit = "=0.10.0"
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile = "3"
