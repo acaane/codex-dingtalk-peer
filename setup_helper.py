@@ -18,11 +18,15 @@ from urllib.parse import parse_qs, urlparse, urlencode
 
 from peer import (ROOT, PeerError, Transport, bind_store_context, codex_command, configured_project,
                   parse_agent_response, load_config, project_local, project_runtime, workbook_robots)
-from peer import webhook_receipt
+from peer import operator_command, webhook_receipt
 from connector_update import safe_path, save_json
 from reliability import instance_lock_owner
 from reliability import SendRejected, acquire_instance_lock
 from windows_secret import protect, unprotect
+
+
+SETUP_ENTRY = operator_command("scripts/setup/setup.cmd")
+CHECK_ENTRY = operator_command("scripts/diagnostics/check.cmd")
 
 
 def say(message):
@@ -239,8 +243,8 @@ def webhook_rejection_message(record):
     code = receipt.get('webhook_errcode') if isinstance(receipt, dict) else None
     suffix = '（错误码' + str(code) + '）' if code is not None and re.fullmatch(r'-?\d{1,12}', str(code)) else ''
     if str(code) == '300005':
-        return '机器人平台已明确拒绝当前Webhook：token不存在（300005）。请从本人的机器人设置重新复制完整Webhook，在setup.cmd中选择“重新粘贴”。'
-    return '机器人平台已明确拒绝接入校验消息' + suffix + '；请核对本人Webhook及机器人安全设置，修正后运行setup.cmd重试。本次不会自动重发。'
+        return f'机器人平台已明确拒绝当前Webhook：token不存在（300005）。请从本人的机器人设置重新复制完整Webhook，在{SETUP_ENTRY}中选择“重新粘贴”。'
+    return f'机器人平台已明确拒绝接入校验消息{suffix}；请核对本人Webhook及机器人安全设置，修正后运行{SETUP_ENTRY}重试。本次不会自动重发。'
 
 
 def recover_wrapped_rejection(record, path):
@@ -320,7 +324,7 @@ def reconcile_identity_probe(config, participant, record, path):
             raise PeerError('接入校验历史结构不可用，已保留待核实状态。')
         if (data.get('complete') is not True or data.get('hasMore') or data.get('partial')
                 or data.get('failures') or data.get('failedCount', 0)):
-            raise PeerError('接入校验历史不完整，已保留状态；请稍后运行setup.cmd核实原消息，不会重复发送。')
+            raise PeerError(f'接入校验历史不完整，已保留状态；请稍后运行{SETUP_ENTRY}核实原消息，不会重复发送。')
         matches = [m for m in data['messages'] if isinstance(m, dict) and m.get('conversationId') == config['group_id'] and m.get('text') == record['text']]
         if matches:
             if any(m.get('senderId') != participant['sender_id'] for m in matches):
@@ -333,7 +337,7 @@ def reconcile_identity_probe(config, participant, record, path):
             save_json(path, record)
             say('本人Webhook已通过真实群消息发送者ID校验。')
             return
-    raise PeerError('接入校验消息尚未核实，已保留状态且不会重复发送；请稍后运行setup.cmd核实，勿删除identity-check记录或重复粘贴凭据。')
+    raise PeerError(f'接入校验消息尚未核实，已保留状态且不会重复发送；请稍后运行{SETUP_ENTRY}核实，勿删除identity-check记录或重复粘贴凭据。')
 
 
 def diagnose_webhook_send():
@@ -350,7 +354,7 @@ def diagnose_webhook_send():
     original_path = safe_path(ROOT, f'.local/identity-check-{peer_id}.json')
     original = json.loads(original_path.read_text(encoding='utf-8')) if original_path.exists() else {}
     if original.get('fingerprint') != fingerprint:
-        raise PeerError('当前凭据或身份与原校验记录不符，请先运行setup.cmd核对；未发送诊断消息。')
+        raise PeerError(f'当前凭据或身份与原校验记录不符，请先运行{SETUP_ENTRY}核对；未发送诊断消息。')
     if original.get('state') == 'verified':
         raise PeerError('本人Webhook接入校验已经通过，无需发送新的诊断消息。')
     path = safe_path(ROOT, f'.local/webhook-diagnostic-{peer_id}.json')
@@ -864,7 +868,7 @@ def run_json(command):
     try:
         data = json.loads(result.stdout or result.stderr)
     except ValueError:
-        raise PeerError("工具没有返回预期结果，请运行 check.cmd 检查环境；原始输出未展示以保护凭据。") from None
+        raise PeerError(f"工具没有返回预期结果，请运行 {CHECK_ENTRY} 检查环境；原始输出未展示以保护凭据。") from None
     if result.returncode or "error" in data:
         err = data.get("error", {})
         raise PeerError(f"工具调用未成功（code={err.get('code', result.returncode)}, reason={err.get('reason', 'unknown')}），请检查账号和群权限。")
@@ -877,7 +881,7 @@ def choose_profile(data, input_fn=input):
     if len(current) == 1:
         return current[0]
     if not profiles:
-        raise PeerError("没有可用的钉钉登录身份，请重新运行 setup.cmd 登录。")
+        raise PeerError(f"没有可用的钉钉登录身份，请重新运行 {SETUP_ENTRY} 登录。")
     say("请选择本机使用的钉钉身份：")
     for index, profile in enumerate(profiles, 1):
         say(f"  {index}. {profile.get('corpName', '')} / {profile.get('userName', '')}")

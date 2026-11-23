@@ -9,10 +9,10 @@
 
 以后：
 - start.cmd：启动本机机器人，保持窗口打开。
-- task.cmd：输入任务目标并发送给另一端；双方需已启动。
-- stop-task.cmd：输入群消息里的12位任务编号，停止该任务。
-- check.cmd：检查账号、群和本机Codex。
-- setup.cmd：重新选择机器人、项目或重新配置。
+- scripts/run/task.cmd：输入任务目标并发送给另一端；双方需已启动。
+- scripts/run/stop-task.cmd：输入群消息里的12位任务编号，停止该任务。
+- scripts/diagnostics/check.cmd：检查账号、群和本机Codex。
+- scripts/setup/setup.cmd：重新选择机器人、项目或重新配置。
 - Ctrl+C：在运行窗口中停止本机连接器。
 
 工具优先复用本机已有的 Python、Node.js、DWS、Codex，并显示实际版本。
@@ -27,4 +27,4 @@ Webhook加密保存在本机 .local 中，不要把部署后的 .local 或登录
 AI联调 项目 <项目标识> 开始 请双方检查接口字段，列出差异并结束。
 
 群内启动需要两台电脑登录各自的钉钉身份。
-如果只在一台电脑用同一账号模拟，请使用 task.cmd 发起任务。
+如果只在一台电脑用同一账号模拟，请使用 scripts/run/task.cmd 发起任务。

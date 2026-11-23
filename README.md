@@ -1,8 +1,10 @@
-# 钉钉 Codex P2P 验证连接器
+# 钉钉 Codex P2P 连接器 · Python v1.0
 
 独立于业务程序运行的 AI 协作连接器。各同事使用自己的 DWS/Codex 登录，通过配置群和自定义 Webhook 机器人交换任务、进度及总结，不依赖公司协调服务器。
 
 本项目负责消息、任务、重试续接、更新和记录；业务源码由对应负责人维护。当前程序已实现 Codex 会话适配，通用说明也可用于其他 AI 工具，但其他工具仍需各自实现和验证适配器。
+
+`main` 保存 Python v1.0，发行以标签 `v1.0` 为准。后续重构在独立历史的 `master` 开发。
 
 ## 快速开始
 
@@ -25,13 +27,13 @@
 
 自动创建仅建立本机协调会话，不调用模型、不启动业务程序或设备；收到明确授权任务后沿用原生队列和执行门禁。创建回执不明保留记录，不反复新建。账号默认模型用于首次检查，不再固定优先某个模型；网络检查超时显示中文处理说明。未能确定的项目、目录及本人Webhook仍需本人补充，不能仅凭名称推断或索取同事凭据。
 
-使用 sub2api 等自定义模型提供方时，在本机 Codex 用户级 `config.toml` 选中该提供方，并由本人配置网关凭据。当前提供方不需要 OpenAI 登录时，连接器沿用本机模型配置，通过一次实际调用确认可用。已有部署切换模型提供方后，正常停止连接器并运行 `check.cmd`，通过后再运行 `start.cmd`。[本机配置示例](docs/participant-onboarding.txt)
+使用 sub2api 等自定义模型提供方时，在本机 Codex 用户级 `config.toml` 选中该提供方，并由本人配置网关凭据。当前提供方不需要 OpenAI 登录时，连接器沿用本机模型配置，通过一次实际调用确认可用。已有部署切换模型提供方后，正常停止连接器并运行 `scripts/diagnostics/check.cmd`，通过后再运行 `start.cmd`。[本机配置示例](docs/participant-onboarding.txt)
 
-接入校验会短暂等待群历史同步，仅回读原消息。平台明确拒绝时，修正后运行 `setup.cmd` 可重试一次；回执不明时仍不重发。`collect-group-info.cmd` 可在接入未完成时生成 `group-diagnostics.json`，包含实际 DWS 版本、公开发送能力、群身份和原校验状态，不发送消息、不更改授权或输出凭据。
+接入校验会短暂等待群历史同步，仅回读原消息。平台明确拒绝时，修正后运行 `scripts/setup/setup.cmd` 可重试一次；回执不明时仍不重发。`scripts/diagnostics/collect-group-info.cmd` 可在接入未完成时生成 `group-diagnostics.json`，包含实际 DWS 版本、公开发送能力、群身份和原校验状态，不发送消息、不更改授权或输出凭据。
 
-需要更换本人 Webhook 时运行 `setup.cmd`，在已保存 Webhook 的提示中选 `2=重新粘贴`，只在本机隐藏输入当前完整链接。回车默认复用已保存值，旁边的旧 Excel 不覆盖这个选择。平台返回 `300005 / token is not exist` 时检查当前机器人链接；原接入记录会在凭据更换后保留副本，不必删除 `.local` 或重装登录。
+需要更换本人 Webhook 时运行 `scripts/setup/setup.cmd`，在已保存 Webhook 的提示中选 `2=重新粘贴`，只在本机隐藏输入当前完整链接。回车默认复用已保存值，旁边的旧 Excel 不覆盖这个选择。平台返回 `300005 / token is not exist` 时检查当前机器人链接；原接入记录会在凭据更换后保留副本，不必删除 `.local` 或重装登录。
 
-原回执缺少错误详情时，`check-webhook.cmd` 会独立发送一条连接器诊断消息，生成 `webhook-diagnostics.json`。同一凭据的诊断回执不明时，再次运行只核实原诊断消息；明确拒绝并修正后才允许新尝试。实际发送者核实成功后，正常 `setup.cmd` 可复用这份身份证据，原未知消息和未授权配置仍保留。
+原回执缺少错误详情时，`scripts/diagnostics/check-webhook.cmd` 会独立发送一条连接器诊断消息，生成 `webhook-diagnostics.json`。同一凭据的诊断回执不明时，再次运行只核实原诊断消息；明确拒绝并修正后才允许新尝试。实际发送者核实成功后，正常 `scripts/setup/setup.cmd` 可复用这份身份证据，原未知消息和未授权配置仍保留。
 
 双击 `start.cmd` 即可首次设置；agent也可在本机执行 `setup_helper.py discover --partner <已有机器人名称> --project-id <双方约定标识>`，再配置本机业务目录。检测结果只保存在各自 `.local`。源码和发行包不附任何同事的私人配置、凭据或项目状态；详细步骤见 [首次接入说明](docs/participant-onboarding.txt)。
 
@@ -40,17 +42,17 @@
 | 入口 | 作用 |
 | --- | --- |
 | `start.cmd` | 检查环境并启动连接器，已启用更新时同时检查版本 |
-| `setup.cmd` | 重新配置本人、业务目录和机器人 |
-| `check.cmd` | 校验账号、群身份及一次小规模 Codex 调用 |
-| `task.cmd` | 从本机向对端发起任务 |
-| `resume.cmd` | 按已保存进度继续或建立关联任务 |
-| `stop-task.cmd` | 停止指定任务 |
-| `enable-auto-update.cmd` | 启用更新接收并通过监护器启动 |
-| `publish-update.cmd` | 手动发布当前连接器白名单代码 |
-| `collect-group-info.cmd` | 只读采集当前群身份诊断 |
-| `check-webhook.cmd` | 一次独立发送检查，保存脱敏回执并核实实际机器人 |
-| `collect-event-info.cmd` | 只读采集监听/总线诊断 |
-| `recover-event-bus.cmd` | 通过安全门禁后处理旧总线 PID |
+| `scripts/setup/setup.cmd` | 重新配置本人、业务目录和机器人 |
+| `scripts/diagnostics/check.cmd` | 校验账号、群身份及一次小规模 Codex 调用 |
+| `scripts/run/task.cmd` | 从本机向对端发起任务 |
+| `scripts/run/resume.cmd` | 按已保存进度继续或建立关联任务 |
+| `scripts/run/stop-task.cmd` | 停止指定任务 |
+| `scripts/run/enable-auto-update.cmd` | 启用更新接收并通过监护器启动 |
+| `scripts/release/publish-update.cmd` | 手动发布当前连接器白名单代码 |
+| `scripts/diagnostics/collect-group-info.cmd` | 只读采集当前群身份诊断 |
+| `scripts/diagnostics/check-webhook.cmd` | 一次独立发送检查，保存脱敏回执并核实实际机器人 |
+| `scripts/diagnostics/collect-event-info.cmd` | 只读采集监听/总线诊断 |
+| `scripts/diagnostics/recover-event-bus.cmd` | 通过安全门禁后处理旧总线 PID |
 
 命令行示例：
 
@@ -69,7 +71,7 @@ AI联调 项目 project-alpha 停止 <12位任务编号>
 AI联调 项目 project-alpha 继续 <12位任务编号> <可选新目标>
 ```
 
-DWS 不推送当前登录用户自己发送的自然人消息，由另一台电脑按主人身份转发。单机同账号模拟使用本地 `task.cmd`，不要把模拟成功当成真实业务通过。
+DWS 不推送当前登录用户自己发送的自然人消息，由另一台电脑按主人身份转发。单机同账号模拟使用本地 `scripts/run/task.cmd`，不要把模拟成功当成真实业务通过。
 
 ## 协调 agent 与业务边界
 
@@ -113,9 +115,9 @@ CLI回合结束状态另存本项目`business-consumers/turn-<队列ID>.json`。
 
 ## 更换联调项目
 
-1. 正常停止本机连接器，运行 `setup.cmd`，选择新的业务目录和项目标识。新项目必须填写标识，例如 `project-alpha`；双方使用相同标识，取值为1至64位小写字母、数字、下划线或连字符。
+1. 正常停止本机连接器，运行 `scripts/setup/setup.cmd`，选择新的业务目录和项目标识。新项目必须填写标识，例如 `project-alpha`；双方使用相同标识，取值为1至64位小写字母、数字、下划线或连字符。
 2. 新配置自动建立该项目的协调会话，或在原业务协调 agent 会话中登记。新项目不会继承其他项目的 agent、未完成任务或 `latest` 续接记录。
-3. 用 `task.cmd` 发起新任务；群指令明确写项目，例如 `AI联调 项目 project-alpha 开始 核对接口`、`AI联调 项目 project-alpha 继续 <任务编号>`。
+3. 用 `scripts/run/task.cmd` 发起新任务；群指令明确写项目，例如 `AI联调 项目 project-alpha 开始 核对接口`、`AI联调 项目 project-alpha 继续 <任务编号>`。
 
 项目配置保存在 `.local/projects/<项目标识>/config.json`；`.local/config.json` 是当前选中的配置。重新选择已有标识和原目录可使用其保存的项目记录。更改同一标识的工作目录时，已有任务库会拒绝混用；为不同目录的独立工作建立新标识。
 
@@ -141,25 +143,28 @@ A 离线或检查失败时继续当前版本。发送未知、发布中断、已
 
 ## 诊断与保留范围
 
-登录与群身份修复已包含当前源码；历史 `login-hotfix`、`group-identity-hotfix` 独立补丁已停用。登录失败重新运行 `setup.cmd`；身份诊断使用 `collect-group-info.cmd`，只提交生成的诊断 JSON，不提交 `.local`。
+登录与群身份修复已包含当前源码；历史 `login-hotfix`、`group-identity-hotfix` 独立补丁已停用。登录失败重新运行 `scripts/setup/setup.cmd`；身份诊断使用 `scripts/diagnostics/collect-group-info.cmd`，只提交生成的诊断 JSON，不提交 `.local`。
 
-`discover bus`、`bus child startup failure` 且未 ready 时，消息通道尚未启动。先正常停止失败监听，运行 `collect-event-info.cmd` 生成脱敏 JSON。恢复入口先核同一 profile、路径、无活动订阅/进程，再取得 DWS 实际文件锁并确认 PID 未变，才清空旧 PID；保留原锁、登录和保护数据。门禁不满足就停止，不凭错误码杀共享进程或重置账号。
+`discover bus`、`bus child startup failure` 且未 ready 时，消息通道尚未启动。先正常停止失败监听，运行 `scripts/diagnostics/collect-event-info.cmd` 生成脱敏 JSON。恢复入口先核同一 profile、路径、无活动订阅/进程，再取得 DWS 实际文件锁并确认 PID 未变，才清空旧 PID；保留原锁、登录和保护数据。门禁不满足就停止，不凭错误码杀共享进程或重置账号。
 
 本版使用个人 DWS 监听及群自定义 Webhook，沿用现有账号；不采用企业应用发布/审批路线。消息身份按真实发送者 ID 校验，不按名称或正文 A/B 授权。Webhook 通过 Windows DPAPI 保存，只支持当前实现验证的关键词 URL；不把令牌放进提示、日志或发布包。三端以上协作、其他 AI 适配器、消息撤回及现场设备验收尚未作为本工程通用能力验证。
 
 ## 开发与发行
 
+脚本位于 `scripts/setup`、`scripts/run`、`scripts/diagnostics` 和 `scripts/release`，单元测试位于 `tests`。根目录保留 `start.cmd`、现有监护和群更新所用文件，以及原有构建和演示命令。
+
 ```powershell
 python -m unittest -v
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ToolsOnly
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ToolsOnly -PortableOnly
 python build_package.py
 python build_package.py --patch-only
 python build_package.py --event-diagnostics-only
 python build_package.py --bus-recovery-only
 ```
 
-测试包含真实临时子进程/文件锁和模拟服务，不要求重跑群通信或业务设备。`check.cmd` 会做实际模型调用，`demo.py` 会在授权群发模拟任务并运行 120 秒，按需要单独执行。
+测试包含真实临时子进程/文件锁和模拟服务，不要求重跑群通信或业务设备。`scripts/diagnostics/check.cmd` 会做实际模型调用，`demo.py` 会在授权群发模拟任务并运行 120 秒，按需要单独执行。
 
-发行构建要求 Python 3.11+，从根目录源码和指南白名单生成精简包，并从 `vendor/windows-x64` 的独立 Python/DWS/Codex 生成完整 Windows 包。运行时源目录是必要资产，不能作旧副本删除。输出与 SHA-256 在 `dist`，已知凭据必须通过扫描。私有 `.local`、`.tools/toolchain.json`、运行数据库、Excel 和业务联调资料不打包。
+发行构建要求 Python 3.11+。在隔离目录按文件清单生成精简包，并从 `vendor/windows-x64` 的独立 Python/DWS/Codex 生成完整 Windows 包。输出与 SHA-256 在构建目录的 `dist`，正式交付按版本保留。清单排除本机交接、私人配置、运行数据库、Excel 和业务联调资料。
 
-Windows PowerShell 5.1 脚本保留 UTF-8 BOM，CMD 保持 ASCII；路径支持中文和空格。依赖优先复用，不更改全局环境。工程交接状态与本轮维护结果见 [HANDOFF.md](HANDOFF.md)。
+Windows PowerShell 5.1 脚本保留 UTF-8 BOM，CMD 保持 ASCII；路径支持中文和空格。依赖优先复用，不更改全局环境。本机工程交接记录保存在 `HANDOFF.md`。

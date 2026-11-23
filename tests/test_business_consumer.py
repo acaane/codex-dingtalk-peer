@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import business_consumer as consumer
 import setup_helper
-import test_business_bridge as fixtures
+from tests import test_business_bridge as fixtures
 from reliability import acquire_instance_lock
 
 THREAD=fixtures.THREAD

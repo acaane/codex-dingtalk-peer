@@ -36,6 +36,12 @@ BUSINESS_PREFIX = '【AI联调委派】'
 THREAD_ID = r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}'
 
 
+def operator_command(relative_path):
+    """Point to the installed command, including in flat deployments patched in place."""
+    path = ROOT / relative_path
+    return relative_path if path.is_file() else path.name
+
+
 def log(event, **fields):
     print(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "event": event, **fields}, ensure_ascii=False), flush=True)
     message = update_message(event, **fields)
@@ -1465,7 +1471,7 @@ def listen_once(config, peer, duration):
         error = listener_startup_error(failures, transport.token)
         record = {"detail": str(error), "retryable": error.retryable, "retry_after_seconds": error.retry_after,
                   "protected": error.protected, "exit_code": process.returncode,
-                  "diagnostics_entry": "collect-event-info.cmd"}
+                  "diagnostics_entry": operator_command("scripts/diagnostics/collect-event-info.cmd")}
         (runtime / "listener-startup-error.json").write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         raise error
     session = PeerSession(config, peer, store, transport, runtime, cancelled)
@@ -1610,7 +1616,7 @@ def run_peer(config, peer, duration):
         except ListenerStartupError as error:
             startup_budget = min(startup_budget, error.additional_attempts)
             log("listener_startup_failed", peer=peer["id"], retryable=error.retryable, max_additional_attempts=startup_budget,
-                reason=str(error), diagnostics_entry="collect-event-info.cmd")
+                reason=str(error), diagnostics_entry=operator_command("scripts/diagnostics/collect-event-info.cmd"))
             if duration != "0" or attempt >= startup_budget:
                 return 1
             delay = max(delay, error.retry_after)

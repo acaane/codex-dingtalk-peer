@@ -7,7 +7,9 @@ import types
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("event_info", Path(__file__).with_name("collect-event-info.py"))
+spec = importlib.util.spec_from_file_location(
+    "event_info", Path(__file__).resolve().parents[1] / "scripts/diagnostics/collect-event-info.py"
+)
 info = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(info)
 

@@ -23,7 +23,7 @@ def locked_by_child(path):
               'lock=acquire_instance_lock(sys.argv[1], {"peer":"A"}); '
               'print("locked",flush=True); sys.stdin.readline(); lock.close()')
     child = subprocess.Popen([sys.executable, '-X', 'utf8', '-c', script, str(path)],
-                             cwd=Path(__file__).resolve().parent, stdin=subprocess.PIPE,
+                             cwd=peer.ROOT, stdin=subprocess.PIPE,
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
     try:
         if child.stdout.readline().strip() != 'locked':
@@ -60,7 +60,7 @@ class InstanceControlTests(unittest.TestCase):
 
     def test_null_stdin_is_not_an_interactive_windows_console(self):
         script = 'import json; from setup_helper import interactive_console; print(json.dumps(interactive_console()))'
-        child = subprocess.run([sys.executable,'-c',script], cwd=Path(__file__).resolve().parent,
+        child = subprocess.run([sys.executable,'-c',script], cwd=peer.ROOT,
                                stdin=subprocess.DEVNULL,capture_output=True,text=True,timeout=10)
         self.assertEqual(child.returncode, 0)
         self.assertIs(json.loads(child.stdout), False)

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import setup_helper
 from reliability import PeerError
-import test_business_bridge as bridge_fixtures
+from tests import test_business_bridge as bridge_fixtures
 
 THREAD = bridge_fixtures.THREAD
 OTHER = bridge_fixtures.OTHER

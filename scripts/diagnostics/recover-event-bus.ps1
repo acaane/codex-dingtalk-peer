@@ -60,8 +60,9 @@ if ($LibraryOnly) { return }
 [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false)
 $env:PYTHONUTF8 = '1'
 try {
-    Set-Location -LiteralPath $PSScriptRoot
-    $tools = Get-Content -LiteralPath (Join-Path $PSScriptRoot '.tools/toolchain.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $peerRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..'))
+    Set-Location -LiteralPath $peerRoot
+    $tools = Get-Content -LiteralPath (Join-Path $peerRoot '.tools/toolchain.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $pythonExe = $tools.python_path
     if (-not (Test-Path -LiteralPath $pythonExe -PathType Leaf)) { throw 'Configured Python was not found. Keep the existing installation.' }
     $planText = & $pythonExe (Join-Path $PSScriptRoot 'collect-event-info.py') --bus-plan
@@ -73,7 +74,7 @@ try {
     $owner = Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -eq $plan.holder_pid } | Select-Object ProcessId,Name,CreationDate
     Write-Host ('Recorded PID: ' + $plan.holder_pid)
     if ($owner) { Write-Host ('Current PID belongs to: ' + $owner.Name) }
-    $backup = Clear-StaleBusPid -DwsRoot $plan.dws_root -IdentityHash $plan.identity_hash -ExpectedPid $plan.holder_pid -PeerRoot $PSScriptRoot
+    $backup = Clear-StaleBusPid -DwsRoot $plan.dws_root -IdentityHash $plan.identity_hash -ExpectedPid $plan.holder_pid -PeerRoot $peerRoot
     Write-Host 'Recovery completed: cleared only the stale PID in bus.lock.' -ForegroundColor Green
     Write-Host ('Recovery record: ' + $backup)
     Write-Host 'No process was stopped. Login, subscriptions, protection records, and bus.meta were preserved.'
@@ -81,6 +82,6 @@ try {
     exit 0
 } catch {
     Write-Host ('Recovery withheld or failed: ' + $_.Exception.Message) -ForegroundColor Red
-    Write-Host 'Keep the error and run collect-event-info.cmd for diagnostics.'
+    Write-Host 'Keep the error and run scripts/diagnostics/collect-event-info.cmd for diagnostics.'
     exit 1
 }

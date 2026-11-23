@@ -102,15 +102,16 @@ def recovery_plan(root):
 
 
 if __name__ == "__main__":
+    root = Path(__file__).resolve().parents[2]
     if sys.argv[1:] == ["--bus-plan"]:
         try:
-            print(json.dumps(recovery_plan(Path(__file__).resolve().parent), ensure_ascii=False))
+            print(json.dumps(recovery_plan(root), ensure_ascii=False))
         except (OSError, ValueError, KeyError) as error:
             print(json.dumps({"ok": False, "reason": str(error) if isinstance(error, ValueError) else type(error).__name__}))
         raise SystemExit(0)
     print("Read-only DWS diagnostics. No login, subscription changes, or messages.", flush=True)
     try:
-        print("Saved: " + str(collect(Path(__file__).resolve().parent)), flush=True)
+        print("Saved: " + str(collect(root)), flush=True)
     except (OSError, ValueError, KeyError) as error:
         print("Collection failed: " + type(error).__name__, flush=True)
         raise SystemExit(1)

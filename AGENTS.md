@@ -23,10 +23,12 @@
 - 本地单元测试：`python -m unittest -v`；也可使用 `vendor/windows-x64/python-3.13.16/python.exe`。
 - 环境检查：`powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install.ps1 -ToolsOnly`。
 - 包内运行时检查加 `-PortableOnly`；不会登录或向群发送消息。
-- `check.cmd` 会校验账号、群身份并进行一次小规模 Codex 实际调用。`demo.py` 会在已授权测试群中发送模拟任务，两个监听有界运行 120 秒。
+- `scripts/diagnostics/check.cmd` 会校验账号、群身份并进行一次小规模 Codex 实际调用。`demo.py` 会在已授权测试群中发送模拟任务，两个监听有界运行 120 秒。
 - 发行构建：Python 3.11+ 执行 `python build_package.py`。原生运行时来源目录为 `vendor/windows-x64`，最终包位于 `dist`。
 - 不为迁移或文档更新重复开展真实业务测试；有代码变动时执行有针对性的检查。不要无限重试失败的服务写入或重发投递未知的消息。
 
 ## 交接
 
 更新 `HANDOFF.md` 的完成状态、已验证范围、未完成事项和关键入口。真实双机双账号通信已于 2026-10-23 通过，任务 `c7ce78088bb4`。下一位 agent 优先确认双方真实项目与接口，再进行只读业务对比；不要重新把部署与基础通信当成未验证事项。
+
+Python 版以 `main` 和 `v1.0` 交付。后续重构在独立历史的 `master` 使用开发分支，推送远程同名分支，在 GitHub 合并后再拉取 `master` 同步。

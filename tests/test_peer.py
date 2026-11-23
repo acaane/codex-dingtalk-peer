@@ -9,6 +9,17 @@ import peer
 from peer import Store, decode, encode, trusted
 
 
+class OperatorCommandTests(unittest.TestCase):
+    def test_prefers_classified_command_and_supports_legacy_installations(self):
+        command = "scripts/diagnostics/collect-event-info.cmd"
+        with tempfile.TemporaryDirectory() as folder, patch.object(peer, "ROOT", Path(folder)):
+            self.assertEqual(peer.operator_command(command), "collect-event-info.cmd")
+            installed = Path(folder) / command
+            installed.parent.mkdir(parents=True)
+            installed.touch()
+            self.assertEqual(peer.operator_command(command), command)
+
+
 class RoutingTests(unittest.TestCase):
     def setUp(self):
         self.config = {"group_id": "test-group", "peers": [{"id": "A", "sender_id": "robot-A"}, {"id": "B", "sender_id": "robot-B"}]}

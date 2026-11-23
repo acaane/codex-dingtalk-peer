@@ -8,7 +8,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-spec = importlib.util.spec_from_file_location("bus_recovery_info", Path(__file__).with_name("collect-event-info.py"))
+DIAGNOSTICS = Path(__file__).resolve().parents[1] / "scripts/diagnostics"
+spec = importlib.util.spec_from_file_location("bus_recovery_info", DIAGNOSTICS / "collect-event-info.py")
 info = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(info)
 
@@ -76,7 +77,7 @@ class WindowsBusPidRecoveryTests(unittest.TestCase):
     def run_recovery(self, expected=None):
         def quote(value):
             return "'" + str(value).replace("'", "''") + "'"
-        script = Path(__file__).with_name("recover-event-bus.ps1").resolve()
+        script = DIAGNOSTICS / "recover-event-bus.ps1"
         command = ". " + quote(script) + " -LibraryOnly\nClear-StaleBusPid -DwsRoot " + quote(self.dws_root) + " -IdentityHash " + quote(self.identity) + " -ExpectedPid " + str(expected or self.pid) + " -PeerRoot " + quote(self.root)
         return subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
 
