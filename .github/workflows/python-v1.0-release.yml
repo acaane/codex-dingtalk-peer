@@ -22,6 +22,10 @@ jobs:
         with:
           ref: refs/tags/v1.0
           persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.13'
+
       - name: Stage verified Windows runtimes
         shell: pwsh
         run: |
@@ -45,7 +49,6 @@ jobs:
           $pythonDir = Join-Path $vendor $spec.directory
           Get-VerifiedArchive $spec.url $pythonZip SHA256 $spec.sha256
           Expand-Archive -LiteralPath $pythonZip -DestinationPath $pythonDir
-          [IO.File]::WriteAllLines((Join-Path $pythonDir 'python313._pth'), @('python313.zip', '.', (Get-Location).Path))
 
           $dwsZip = Join-Path $scratch 'dws.zip'
           Get-VerifiedArchive 'https://github.com/DingTalk-Real-AI/dingtalk-workspace-cli/releases/download/v1.0.65/dws-windows-amd64.zip' $dwsZip SHA256 'db7cd21655ede7375676a349f44f5d9116fe28a8836276244341e109314407b7'
@@ -74,14 +77,21 @@ jobs:
 
       - name: Test, build, and smoke-test the release packages
         shell: pwsh
+        env:
+          PYTHONUTF8: '1'
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          $python = '.\vendor\windows-x64\python-3.13.16\python.exe'
-          & $python -B -W error::ResourceWarning -m unittest -v
-          & $python -B build_package.py
-          & $python -B build_package.py --patch-only
-          & $python -B build_package.py --bus-recovery-only
-          & $python -B build_package.py --event-diagnostics-only
+          # The Windows runner's default TEMP can be an 8.3 alias. The tests
+          # compare canonical paths when checking filesystem boundaries.
+          $temp = Join-Path $env:RUNNER_TEMP 'python-v1.0-tests'
+          New-Item -ItemType Directory -Path $temp | Out-Null
+          $env:TEMP = $temp
+          $env:TMP = $temp
+          python -B -W error::ResourceWarning -m unittest -v
+          python -B build_package.py
+          python -B build_package.py --patch-only
+          python -B build_package.py --bus-recovery-only
+          python -B build_package.py --event-diagnostics-only
 
           @'
           from pathlib import Path
@@ -92,7 +102,7 @@ jobs:
                   bad_entry = archive.testzip()
                   if bad_entry is not None:
                       raise SystemExit(f"{path}: CRC check failed for {bad_entry}")
-          '@ | & $python -B -
+          '@ | python -B -
           $smoke = Join-Path $env:RUNNER_TEMP '中文 验证'
           Expand-Archive -LiteralPath 'dist/codex-dingtalk-peer-windows-full.zip' -DestinationPath $smoke
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $smoke 'install.ps1') -ToolsOnly -PortableOnly
