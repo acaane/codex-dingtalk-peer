@@ -89,6 +89,7 @@ impl Binding {
             label: codex::COORDINATOR_NAME.into(),
         };
         let mut transaction = db.begin().await.map_err(io::Error::other)?;
+        // A manual binding saved in another window can supersede this request.
         if !clear_creation(&mut transaction, room_id, &request)
             .await
             .map_err(io::Error::other)?
