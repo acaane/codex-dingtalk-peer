@@ -10,7 +10,8 @@ from peer import ROOT, workbook_robots
 DIAGNOSTICS = "scripts/diagnostics"
 EVENT_DIAGNOSTICS = {f"{DIAGNOSTICS}/collect-event-info.{suffix}" for suffix in ("cmd", "ps1", "py")}
 BUS_RECOVERY = {f"{DIAGNOSTICS}/recover-event-bus.{suffix}" for suffix in ("cmd", "ps1")}
-PACKAGED_DOCS = ("coordinator-start.txt", "connector-recovery-update.txt", "participant-onboarding.txt")
+PACKAGED_DOCS = ("coordinator-start.txt", "connector-recovery-update.txt",
+                 "participant-onboarding.txt", "python-post-v1.0-handoff.md")
 OPERATOR_SCRIPTS = {
     "scripts/setup/setup.cmd",
     "scripts/run/task.cmd", "scripts/run/resume.cmd", "scripts/run/stop-task.cmd",

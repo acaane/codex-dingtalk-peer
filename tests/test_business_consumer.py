@@ -397,6 +397,71 @@ class ConsumerTests(unittest.TestCase):
         self.assertEqual([p['queuedSubmissionId'] for m,p in calls if m=='thread/queue/start'],[MESSAGE,second])
         self.assertEqual(state['state'],'idle')
 
+    def test_running_host_uses_each_selected_job_deadline(self):
+        second = '33333333-3333-4333-8333-333333333333'
+        now = time.time()
+        row = self.bridge.store.meta('business_job:' + self.identity)
+        self.bridge.store.set_meta('business_job:' + self.identity, dict(row, expires_at=now + 10))
+        self.bridge.store.set_meta('business_job:second',
+                                   dict(row, id='second', queue_message_id=second, expires_at=now + 120))
+        self.request['expires_at'] = now + 10
+        clock = [now]
+
+        class TwoDeadlines(FakeClient):
+            def call(inner, method, params, timeout=20):
+                result = super().call(method, params, timeout)
+                if method == 'thread/queue/start' and params['queuedSubmissionId'] == second:
+                    clock[0] = now + 11
+                return result
+
+        fake = TwoDeadlines(queued=[MESSAGE, second])
+        with patch.object(consumer.time, 'time', side_effect=lambda: clock[0]):
+            state, calls = self.run_consumer(fake)
+        self.assertEqual(state['state'], 'idle')
+        self.assertEqual([params['queuedSubmissionId'] for method, params in calls
+                          if method == 'thread/queue/start'], [MESSAGE, second])
+        self.assertFalse(any(method == 'turn/interrupt' for method, _ in calls))
+        self.assertEqual(json.loads((self.bridge.runtime.parent / 'business-consumers' /
+                                     f'turn-{second}.json').read_text(encoding='utf-8'))['status'], 'completed')
+
+    def test_automatic_turn_gets_later_deadline_only_with_exact_input(self):
+        import hashlib
+
+        now = time.time()
+        self.request['expires_at'] = now + 10
+        row = self.bridge.store.meta('business_job:' + self.identity)
+        self.bridge.store.set_meta('business_job:' + self.identity, dict(row, expires_at=now + 120))
+        message = self.bridge.runtime / (self.identity + '-message.txt')
+        message.write_text('exact business input', encoding='utf-8')
+        reference = setup_helper.business_message_reference(message, hashlib.sha256(message.read_bytes()).hexdigest())
+
+        for matching in (False, True):
+            with self.subTest(matching=matching):
+                clock = [now]
+
+                class AutomaticClient(FakeClient):
+                    def call(inner, method, params, timeout=20):
+                        result = super().call(method, params, timeout)
+                        if method == 'thread/resume':
+                            clock[0] = now + 11
+                            inner.pending.clear()
+                            content = [{'type': 'text', 'text': reference if matching else 'other input'}]
+                            turn = dict(id='automatic', items=[dict(type='userMessage', content=content)])
+                            inner.events.extend([
+                                dict(method='turn/started', params=dict(threadId=THREAD, turn=turn)),
+                                dict(method='turn/completed', params=dict(threadId=THREAD,
+                                                                          turn=dict(id='automatic', status='completed'))),
+                            ])
+                        return result
+
+                with patch.object(consumer.time, 'time', side_effect=lambda: clock[0]):
+                    state, calls = self.run_consumer(AutomaticClient())
+                self.assertEqual(any(method == 'turn/interrupt' for method, _ in calls), not matching)
+                self.assertFalse(any(method == 'thread/queue/start' for method, _ in calls))
+                if matching:
+                    path = self.bridge.runtime.parent / 'business-consumers' / f'turn-{MESSAGE}.json'
+                    self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['status'], 'completed')
+
     def test_daily_deadline_interrupts_only_owned_turn_and_starts_nothing_new(self):
         c=consumer.Consumer(self.f.root,self.f.config,self.request)
         fake=FakeClient();c.client=fake;c.turn_id='owned-turn'

@@ -77,6 +77,26 @@ class InstanceControlTests(unittest.TestCase):
             self.assertIn('不是启动失败', out.getvalue())
             self.assertNotIn('This peer is already running', out.getvalue())
 
+    def test_daily_start_repairs_missing_update_policy_and_preserves_existing_choice(self):
+        from connector_update import policy, save_json
+
+        cfg = {'send_authorized': True, 'peers': [{'id': 'B'}, {'id': 'A'}]}
+        policy_path = self.root / '.local/update-policy.json'
+        policy_path.parent.mkdir()
+        for existing in (None, {'enabled': False, 'publisher': 'B', 'auto_publish': False}):
+            with self.subTest(existing=existing):
+                if existing is not None:
+                    save_json(policy_path, existing)
+                with patch.object(setup_helper, 'ROOT', self.root), \
+                        patch.object(setup_helper, 'check_config', return_value=cfg), \
+                        patch.object(setup_helper, 'prepare_local_codex'), \
+                        patch.object(setup_helper, 'ensure_business_agent', return_value={'state': 'reused'}), \
+                        patch.object(setup_helper, 'business_wake_adapter', return_value='cli'), \
+                        patch.object(setup_helper, 'run_supervisor', return_value=0):
+                    self.assertEqual(setup_helper.start_connector(self.root / 'config.json', 'B'), 0)
+                expected = existing or {'enabled': True, 'publisher': 'A', 'auto_publish': True}
+                self.assertEqual(policy(self.root), expected)
+
     def test_viewer_shows_log_and_ctrl_c_keeps_original_lock(self):
         (self.runtime/'connector.log').write_text('ready\n最近一次同步正常\n', encoding='utf-8')
         with acquire_instance_lock(self.runtime/'run.lock', {'peer':'A'}), \

@@ -836,6 +836,13 @@ def ensure_business_agent(config, peer_id, client_factory=None):
         return {'state': 'created', 'thread': thread}
 
 
+def enable_default_updates(config):
+    if config.get('send_authorized') is True and not safe_path(ROOT, '.local/update-policy.json').exists():
+        from connector_update import enable
+        enable(ROOT, min(peer['id'] for peer in config['peers']))
+        say('已自动启用连接器专用更新，后续直接运行 start.cmd 即可。')
+
+
 def start_connector(path, peer_id):
     result = follow_existing_connector(ROOT, peer_id)
     if result is not None:
@@ -843,6 +850,7 @@ def start_connector(path, peer_id):
     # Refresh identity only when starting an instance, not when viewing a running one.
     config = check_config(path)
     prepare_local_codex(config, peer_id)
+    enable_default_updates(config)
     try:
         coordinator = ensure_business_agent(config, peer_id)
         if coordinator['state'] in ('created', 'reused'):
@@ -1390,10 +1398,7 @@ def main():
             if configured_project(config):
                 save_json(safe_path(project_local(ROOT, config), 'config.json'), config)
             raise
-        if not (ROOT / '.local/update-policy.json').exists():
-            from connector_update import enable
-            enable(ROOT, min(p['id'] for p in config['peers']))
-            say('已自动启用连接器专用更新，只接受本项目已配置发布端的真实机器人；业务工程和私人配置不参与更新。')
+        enable_default_updates(config)
         say(f"配置完成：{expected}，模型 {model or '沿用 Codex 本机配置'}。Webhook 已按本机 Windows 用户加密保存。")
         return 0
     path = ROOT / ".local/config.json"

@@ -411,6 +411,7 @@ class Consumer:
         self.current_queue = None
         self.keep_alive=keep_alive
         self.last_status_key=None
+        self.resumed = False
 
     def status(self, state, reason, **fields):
         key=(state,reason,self.current_queue,self.turn_id,json.dumps(fields,sort_keys=True))
@@ -423,7 +424,9 @@ class Consumer:
             preserve_consumer_failure(self.state_path, json.loads(self.state_path.read_text(encoding='utf-8')), self.thread)
 
     def owned_jobs(self):
-        if time.time() >= self.request['expires_at'] or self.config.get('project_id', '') != self.request['project_id']:
+        if self.config.get('project_id', '') != self.request['project_id']:
+            return []
+        if not self.resumed and time.time() >= self.request['expires_at']:
             return []
         policy = json.loads(self.policy_path.read_text(encoding='utf-8'))
         if policy.get('thread') != self.thread or policy.get('workdir') not in (None, self.peer.get('workdir')):
@@ -441,8 +444,10 @@ class Consumer:
                 and re.fullmatch(UUID, str(j.get('queue_message_id', ''))) ]
 
     def authorized_jobs(self):
-        return [j for j in self.owned_jobs() if j.get('state') == 'queued'
-                and j.get('expires_at', 0) > time.time() and not j.get('result_version')]
+        now = time.time()
+        return [job for job in self.owned_jobs() if job.get('state') == 'queued'
+                and type(job.get('expires_at')) in (int, float) and math.isfinite(job['expires_at'])
+                and job['expires_at'] > now and not job.get('result_version')]
 
     def rejected_start_proof(self, old, selected):
         """Only the existing, explicitly rejected native start may be recovered."""
@@ -586,10 +591,35 @@ class Consumer:
                     raise RpcError('原队列消息已有开始尝试，保留原记录，未通过恢复会话重复启动。')
         return identities
 
-    def wait_turn(self):
-        while time.time() < self.request['expires_at']:
+    def native_turn_job(self, items):
+        """Correlate an automatic turn to the exact connector input before using its deadline."""
+        from setup_helper import business_message_reference
+
+        messages = [item['content'] for item in items
+                    if isinstance(item, dict) and item.get('type') == 'userMessage' and 'content' in item]
+        if not messages:
+            return None
+        matches = []
+        for job in self.owned_jobs():
+            expiry = job.get('expires_at')
+            if (type(expiry) not in (int, float) or not math.isfinite(expiry)
+                    or not re.fullmatch(r'[0-9a-f]{12}', str(job.get('id', '')))):
+                continue
+            path = safe_path(self.runtime, 'business-jobs/' + job['id'] + '-message.txt')
+            if not path.is_file() or path.stat().st_size > 131072:
+                continue
+            reference = business_message_reference(path, hashlib.sha256(path.read_bytes()).hexdigest())
+            if any(content == [{'type': 'text', 'text': reference, 'text_elements': []}]
+                   or content == [{'type': 'text', 'text': reference}] for content in messages):
+                matches.append(job)
+        return matches[0] if len(matches) == 1 else None
+
+    def wait_turn(self, expires_at=None, native=False):
+        if expires_at is None:
+            expires_at = self.request['expires_at']
+        while time.time() < expires_at:
             try:
-                data = self.client.events.pop(0) if self.client.events else self.client.receive(min(5, self.request['expires_at'] - time.time()))
+                data = self.client.events.pop(0) if self.client.events else self.client.receive(max(0, min(5, expires_at - time.time())))
             except TimeoutError:
                 continue
             params = data.get('params', {})
@@ -598,6 +628,12 @@ class Consumer:
             turn = params.get('turn', {})
             if data.get('method') == 'turn/started' and not self.turn_id:
                 self.turn_id = turn.get('id')
+            if (native and not self.current_queue and self.turn_id
+                    and params.get('turnId') == self.turn_id and data.get('method') in ('item/started', 'item/completed')):
+                job = self.native_turn_job([params.get('item')])
+                if job:
+                    self.current_queue, expires_at = job['queue_message_id'], job['expires_at']
+                    self.status('turn_started', '已核实自动接续回合属于本项目原委派，采用该委派截止时间。')
             if data.get('method') == 'turn/completed' and (not self.turn_id or turn.get('id') == self.turn_id):
                 self.turn_id = turn.get('id')
                 if self.current_queue:
@@ -618,16 +654,28 @@ class Consumer:
             return False
         params=data.get('params',{})
         if params.get('threadId')==self.thread and data.get('method')=='turn/started':
-            self.turn_id=params.get('turn',{}).get('id');self.current_queue=None
+            turn = params.get('turn', {})
+            self.turn_id, self.current_queue = turn.get('id'), None
+            job = self.native_turn_job(turn.get('items', []))
+            if not job and self.turn_id:
+                try:
+                    recent = self.client.call('thread/turns/list', dict(threadId=self.thread, limit=1,
+                                              sortDirection='desc', itemsView='full'), timeout=2)
+                    exact = next((row for row in recent.get('data', []) if row.get('id') == self.turn_id), {})
+                    job = self.native_turn_job(exact.get('items', []))
+                except (RpcError, TimeoutError):
+                    pass
+            if job:
+                self.current_queue = job['queue_message_id']
             self.status('turn_started','原生会话已自动接续回合，保持宿主并等待结果。')
-            self.wait_turn()
+            self.wait_turn(job['expires_at'] if job else None, native=True)
             return True
         return False
 
     def idle(self, reason):
         self.status('idle',reason+' 宿主保持在线，不重复投递。')
         if not self.keep_alive:return False
-        if time.time()>=self.request['expires_at']:
+        if time.time() >= self.request['expires_at']:
             self.status('deadline','已到本轮截止，结束本轮会话宿主。');return False
         self.native_events(timeout=1)
         return True
@@ -657,9 +705,12 @@ class Consumer:
                 # Some installed backends auto-drain pending input on resume.
                 # A post-resume head check cannot prevent that execution.
                 self.authorized_native_queue()
+                if not self.authorized_jobs():
+                    raise RpcError('委派有效期或绑定已变化，未恢复原会话。')
                 resumed=self.client.call('thread/resume',dict(threadId=self.thread),timeout=60)
                 if resumed.get('thread',{}).get('id')!=self.thread:
                     raise RpcError('后台返回的会话与原绑定不符。')
+                self.resumed = True
                 while True:
                     if self.native_events():continue
                     allowed = {j['queue_message_id']: j for j in self.authorized_jobs()}
@@ -675,7 +726,8 @@ class Consumer:
                         self.status('blocked', '队首含其他来源任务，未跳过或消费未授权消息。');return
                     self.current_queue, self.turn_id = selected, None
                     # Recheck expiry and binding immediately before the one atomic queue start.
-                    if selected not in {j['queue_message_id'] for j in self.authorized_jobs()}:
+                    job = next((row for row in self.authorized_jobs() if row['queue_message_id'] == selected), None)
+                    if not job:
                         self.status('idle', '委派有效期或绑定已变化，未启动。');return
                     attempt=self.state_path.parent / ('attempt-' + selected + '.json')
                     attempt_data=dict(thread=self.thread,queue_message_id=selected,started_at=time.time(),outcome='starting',retry_count=0)
@@ -702,12 +754,12 @@ class Consumer:
                     except TimeoutError:
                         attempt_data['outcome']='unknown';save_json(attempt,attempt_data)
                         self.status('unknown', '开始回执不明，等待原回合结束，不重发或重试开始。')
-                        self.wait_turn();return
+                        self.wait_turn(job['expires_at']);return
                     except RpcError as error:
                         attempt_data.update(outcome='rejected' if error.code in (-32600,-32601,-32602) else 'unknown',error_code=error.code,error_reason=str(error))
                         save_json(attempt,attempt_data)
                         raise
-                    self.wait_turn()
+                    self.wait_turn(job['expires_at'])
             except (RpcError, OSError, ValueError, sqlite3.Error, TimeoutError) as error:
                 reason = str(error) if isinstance(error, RpcError) else '后台消费未完成：' + type(error).__name__
                 self.status('blocked', reason)
