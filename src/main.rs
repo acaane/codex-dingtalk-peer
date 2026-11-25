@@ -2,6 +2,7 @@
 
 mod chat;
 mod room;
+mod room_sessions;
 mod room_view;
 mod storage;
 mod ui;
