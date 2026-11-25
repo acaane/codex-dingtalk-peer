@@ -16,6 +16,7 @@ const MAX_REPORT: usize = 16 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Action {
     Submit(Submission),
+    Inspect { id: Id },
     Claim { id: Id, attempt: Id },
     Report(Report),
 }
@@ -77,6 +78,20 @@ impl Phase {
     pub fn active(&self) -> bool {
         matches!(self, Self::Waiting | Self::Running)
     }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::Waiting => "等待接入端接单".into(),
+            Self::Running => "接入端正在执行".into(),
+            Self::Completed(_) => "已收到接入端回报".into(),
+            Self::Failed(Failure::Timeout) => "接入端执行已到时限".into(),
+            Self::Failed(Failure::Reply) => "接入端会话没有返回正文".into(),
+            Self::Failed(reason) => format!("接入端执行失败。{}", reason.label()),
+            Self::Expired => "已过截止时间，任务未开始".into(),
+            Self::Uncertain => "已到截止时间，结果待核对。请查看接入端原会话".into(),
+            Self::BindingChanged => "会话已更换。请由主协调端重新派单".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -98,6 +113,8 @@ pub struct Grant {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Update {
     pub latest: Option<Task>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inspected: Option<Task>,
     pub acknowledged: Option<Id>,
     pub grant: Option<Grant>,
     pub error: Option<String>,
@@ -217,6 +234,16 @@ pub async fn apply(
             } else {
                 update.error = Some("双方的当前会话需要通过接单验证".into());
             }
+        }
+        Some(Action::Inspect { id }) if role == Member::Host => {
+            if let Some(record) = load(db, Some(id)).await? {
+                if Some(record.bindings[0]) == advertised {
+                    update.inspected = Some(record.task);
+                } else {
+                    update.error = Some("当前主协调会话与该任务的登记会话不同".into());
+                }
+            }
+            return Ok(update);
         }
         Some(Action::Claim { id, attempt }) if role == Member::Guest => {
             if let Some(record) = latest.as_mut().filter(|record| {
@@ -380,6 +407,52 @@ mod tests {
         apply(db, role, command, Some(BINDINGS), Some(binding), now)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn inspection_reads_only_the_requested_host_task() {
+        block_on(async {
+            let mut db = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            initialize(&mut db).await.unwrap();
+            let inspect = Action::Inspect { id: ID };
+
+            let before_start = exchange(&mut db, Member::Host, Some(inspect.clone()), 20).await;
+            assert_eq!(before_start, Update::default());
+            exchange(&mut db, Member::Host, Some(submission()), 21).await;
+            let waiting = exchange(&mut db, Member::Host, Some(inspect.clone()), 22).await;
+            assert_eq!(waiting.inspected.unwrap().phase, Phase::Waiting);
+            assert!(waiting.acknowledged.is_none());
+
+            let guest = exchange(&mut db, Member::Guest, Some(inspect.clone()), 22).await;
+            assert!(guest.inspected.is_none());
+            assert!(guest.error.is_some());
+            let other_host_binding = apply(
+                &mut db,
+                Member::Host,
+                Some(inspect.clone()),
+                Some(BINDINGS),
+                Some([9; 32]),
+                22,
+            )
+            .await
+            .unwrap();
+            assert!(other_host_binding.inspected.is_none());
+            assert!(other_host_binding.error.is_some());
+
+            let expired = exchange(&mut db, Member::Host, Some(inspect.clone()), 81).await;
+            assert_eq!(expired.inspected.unwrap().phase, Phase::Expired);
+            let current = Submission::new("另一项检查", 5).unwrap();
+            let latest = exchange(&mut db, Member::Host, Some(Action::Submit(current)), 82).await;
+            assert_ne!(latest.latest.unwrap().id, ID);
+
+            let previous = exchange(&mut db, Member::Host, Some(inspect), 83)
+                .await
+                .inspected
+                .unwrap();
+            assert_eq!(previous.id, ID);
+            assert_eq!(previous.deadline, 81);
+            assert_eq!(previous.phase, Phase::Expired);
+        });
     }
 
     #[test]

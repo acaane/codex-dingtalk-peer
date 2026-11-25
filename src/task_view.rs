@@ -399,20 +399,6 @@ impl TaskView {
     }
 }
 
-fn task_status(phase: &Phase) -> String {
-    match phase {
-        Phase::Waiting => "等待接入端接单".into(),
-        Phase::Running => "接入端正在执行".into(),
-        Phase::Completed(_) => "已收到接入端回报".into(),
-        Phase::Failed(Failure::Timeout) => "接入端执行已到时限".into(),
-        Phase::Failed(Failure::Reply) => "接入端会话没有返回正文".into(),
-        Phase::Failed(reason) => format!("接入端执行失败。{}", reason.label()),
-        Phase::Expired => "已过截止时间，任务未开始".into(),
-        Phase::Uncertain => "已到截止时间，结果待核对。请查看接入端原会话".into(),
-        Phase::BindingChanged => "会话已更换。请由主协调端重新派单".into(),
-    }
-}
-
 impl Render for TaskView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -427,7 +413,7 @@ impl Render for TaskView {
                 view.child(Label::new("正在等待房间连接").text_sm())
             })
             .when_some(self.latest.as_ref(), |view, task| {
-                view.child(Label::new(task_status(&task.phase)))
+                view.child(Label::new(task.phase.label()))
                     .child(
                         Label::new(format!("任务 ID {}", URL_SAFE_NO_PAD.encode(task.id)))
                             .text_sm(),
