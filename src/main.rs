@@ -1,22 +1,22 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod chat;
+mod room;
+mod room_view;
+mod storage;
 mod ui;
 
-use std::{error::Error, path::PathBuf};
+use std::error::Error;
 
+use futures_lite::future::block_on;
 use gpui_kit::*;
 
 use crate::chat::{ChatStore, Message};
 
-fn open_chat() -> Result<(ChatStore, Vec<Message>), Box<dyn Error>> {
-    let app_data = std::env::var_os("LOCALAPPDATA")
-        .filter(|directory| !directory.is_empty())
-        .ok_or("Windows 未提供 LOCALAPPDATA 数据目录")?;
-    let directory = PathBuf::from(app_data).join("CodexDingTalkPeer");
-    std::fs::create_dir_all(&directory)?;
-    let store = ChatStore::open(&directory.join("chat.sqlite3"))?;
-    let history = store.history()?;
+async fn open_chat() -> Result<(ChatStore, Vec<Message>), Box<dyn Error>> {
+    let directory = storage::data_directory()?;
+    let mut store = ChatStore::open(&directory.join("chat.sqlite3")).await?;
+    let history = store.history().await?;
     Ok((store, history))
 }
 
@@ -36,7 +36,7 @@ fn main() {
             window_min_size: Some(size(px(440.), px(340.))),
             ..Default::default()
         };
-        let chat = open_chat();
+        let chat = block_on(open_chat());
         open_window(options, cx, |window, cx| {
             cx.new(|cx| ui::ChatWindow::new(chat, window, cx))
         })
