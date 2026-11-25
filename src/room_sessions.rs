@@ -9,6 +9,12 @@ use crate::storage;
 pub struct Sessions(SqliteConnection);
 
 impl Sessions {
+    pub fn open_existing(directory: &Path) -> io::Result<Self> {
+        block_on(storage::read_only(&directory.join("room-sessions.sqlite3")))
+            .map(Self)
+            .map_err(io::Error::other)
+    }
+
     pub fn open(directory: &Path) -> io::Result<Self> {
         block_on(async {
             let mut db = storage::connect(&directory.join("room-sessions.sqlite3"))
