@@ -25,7 +25,7 @@ fn main() {
         init(cx);
         let options = WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("AI 联调连接器".into()),
+                title: Some("AI 联调台".into()),
                 ..Default::default()
             }),
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
@@ -40,6 +40,6 @@ fn main() {
         open_window(options, cx, |window, cx| {
             cx.new(|cx| ui::ChatWindow::new(chat, window, cx))
         })
-        .expect("打开联调连接器窗口");
+        .expect("打开 AI 联调台窗口");
     });
 }
