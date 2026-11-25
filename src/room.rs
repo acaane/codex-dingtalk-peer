@@ -350,11 +350,26 @@ impl RoomConnection {
         })
     }
 
-    pub fn resume(directory: &Path) -> io::Result<Self> {
-        match Sessions::open(directory)?
-            .last()?
-            .ok_or_else(|| problem("本机还没有可继续的房间"))?
-        {
+    pub fn recent(directory: &Path) -> io::Result<Vec<(String, Member)>> {
+        let saved = Sessions::open_existing(directory)?.recent::<SavedRoom>()?;
+        Ok(saved
+            .into_iter()
+            .map(|(id, room)| {
+                let member = match room {
+                    SavedRoom::Host { .. } => Member::Host,
+                    SavedRoom::Guest { .. } => Member::Guest,
+                };
+                (id, member)
+            })
+            .collect())
+    }
+
+    pub fn resume(directory: &Path, room_id: Option<&str>) -> io::Result<Self> {
+        let mut sessions = Sessions::open(directory)?;
+        let saved = sessions
+            .opened(room_id)?
+            .ok_or_else(|| problem("本机没有可继续的对应房间"))?;
+        let connection = match saved {
             SavedRoom::Host {
                 invite,
                 key,
@@ -375,7 +390,9 @@ impl RoomConnection {
                 room_id: invite.room_id(),
                 ready: false,
             }),
-        }
+        }?;
+        sessions.mark_opened(&connection.room_id)?;
+        Ok(connection)
     }
 }
 
@@ -848,15 +865,45 @@ mod tests {
             assert!(Instant::now() < deadline, "主机应在关闭后释放监听");
             std::thread::sleep(Duration::from_millis(20));
         }
+        let newer = RoomConnection::create(Ipv4Addr::LOCALHOST, owner_data.path()).unwrap();
+        let newer_code = &newer.host.as_ref().unwrap().1;
+        let _newer_guest = RoomConnection::join(newer_code, guest_data.path()).unwrap();
+        assert_eq!(
+            RoomConnection::recent(owner_data.path()).unwrap(),
+            [
+                (newer.room_id.clone(), Member::Host),
+                (id.clone(), Member::Host)
+            ]
+        );
+        assert_eq!(
+            RoomConnection::recent(guest_data.path()).unwrap(),
+            [
+                (newer.room_id.clone(), Member::Guest),
+                (id.clone(), Member::Guest)
+            ]
+        );
         assert!(Sessions::has_last(guest_data.path()).unwrap());
-        let guest = RoomConnection::resume(guest_data.path()).unwrap();
+        let guest = RoomConnection::resume(guest_data.path(), Some(&id)).unwrap();
         assert!(!guest.ready);
-        let host = RoomConnection::resume(owner_data.path()).unwrap();
+        let host = RoomConnection::resume(owner_data.path(), Some(&id)).unwrap();
         assert_eq!(host.room_id, id);
         assert_eq!(guest.room_id, id);
         assert_eq!(host.host.as_ref().unwrap().1, code);
+        assert_eq!(RoomConnection::recent(owner_data.path()).unwrap()[0].0, id);
+        assert_eq!(
+            RoomConnection::resume(guest_data.path(), None)
+                .unwrap()
+                .room_id,
+            id
+        );
         assert!(RoomConnection::join(&code, other_data.path()).is_err());
         assert!(!Sessions::has_last(other_data.path()).unwrap());
+        assert!(
+            RoomConnection::recent(other_data.path())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(RoomConnection::resume(other_data.path(), Some(&id)).is_err());
         let restarted = readiness::Request {
             attempt: [3; 16],
             ..guest_check

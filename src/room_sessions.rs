@@ -77,16 +77,33 @@ impl Sessions {
         state.map(Self::decode).transpose()
     }
 
-    pub fn last<T: DeserializeOwned>(&mut self) -> io::Result<Option<T>> {
+    pub fn opened<T: DeserializeOwned>(&mut self, id: Option<&str>) -> io::Result<Option<T>> {
         let state = block_on(
             sqlx::query_scalar::<_, Vec<u8>>(
                 "SELECT protected_state FROM room_sessions
-                 WHERE last_opened IS NOT NULL ORDER BY last_opened DESC LIMIT 1",
+                 WHERE last_opened IS NOT NULL AND (?1 IS NULL OR id = ?1)
+                 ORDER BY last_opened DESC LIMIT 1",
             )
+            .bind(id)
             .fetch_optional(&mut self.0),
         )
         .map_err(io::Error::other)?;
         state.map(Self::decode).transpose()
+    }
+
+    pub fn recent<T: DeserializeOwned>(&mut self) -> io::Result<Vec<(String, T)>> {
+        // Leave out credentials reserved for joins that never succeeded.
+        let rows = block_on(
+            sqlx::query_as::<_, (String, Vec<u8>)>(
+                "SELECT id, protected_state FROM room_sessions
+                 WHERE last_opened IS NOT NULL ORDER BY last_opened DESC",
+            )
+            .fetch_all(&mut self.0),
+        )
+        .map_err(io::Error::other)?;
+        rows.into_iter()
+            .map(|(id, state)| Ok((id, Self::decode(state)?)))
+            .collect()
     }
 
     pub fn mark_opened(&mut self, id: &str) -> io::Result<()> {

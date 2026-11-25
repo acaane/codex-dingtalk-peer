@@ -1,4 +1,4 @@
-use std::{io, path::Path, time::Duration};
+use std::{collections::HashMap, io, path::Path, time::Duration};
 
 use sqlx::{Connection, SqliteConnection};
 
@@ -28,6 +28,15 @@ impl Binding {
     pub async fn read_existing(directory: &Path, room_id: &str) -> sqlx::Result<Option<Self>> {
         let mut db = storage::read_only(&directory.join("agent-bindings.sqlite3")).await?;
         Self::load_from(&mut db, room_id).await
+    }
+
+    pub async fn saved_projects(directory: &Path) -> sqlx::Result<HashMap<String, String>> {
+        let mut db = storage::read_only(&directory.join("agent-bindings.sqlite3")).await?;
+        let projects =
+            sqlx::query_as::<_, (String, String)>("SELECT room_id, project FROM agent_bindings")
+                .fetch_all(&mut db)
+                .await?;
+        Ok(projects.into_iter().collect())
     }
 
     pub async fn save(&self, directory: &Path, room_id: &str) -> sqlx::Result<()> {

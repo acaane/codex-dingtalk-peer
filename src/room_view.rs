@@ -14,6 +14,7 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder, *};
 
 use crate::{
+    agent_binding::Binding,
     agent_view::AgentView,
     codex,
     readiness::{self, Id, Status},
@@ -27,11 +28,19 @@ pub struct RoomView {
     selected: Option<Ipv4Addr>,
     invite: Entity<TextareaState>,
     can_resume: bool,
+    recent: Option<Vec<RecentRoom>>,
+    loading_recent: bool,
     composer: Entity<TextareaState>,
     connecting: bool,
     notice: Option<SharedString>,
     active: Option<ActiveRoom>,
     sync: Option<Task<()>>,
+}
+
+struct RecentRoom {
+    id: String,
+    member: Member,
+    project: Option<String>,
 }
 
 struct ActiveRoom {
@@ -152,6 +161,8 @@ impl RoomView {
             can_resume: crate::storage::data_directory()
                 .and_then(|directory| Sessions::has_last(&directory))
                 .unwrap_or(false),
+            recent: None,
+            loading_recent: false,
             invite: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .rows(3)
@@ -169,14 +180,53 @@ impl RoomView {
         }
     }
 
+    fn toggle_recent(&mut self, cx: &mut Context<Self>) {
+        if self.recent.take().is_some() {
+            cx.notify();
+            return;
+        }
+        self.loading_recent = true;
+        self.notice = None;
+        let recent = cx.background_executor().spawn(async {
+            let directory = crate::storage::data_directory()?;
+            let rooms = RoomConnection::recent(&directory)?;
+            let mut projects = Binding::saved_projects(&directory)
+                .await
+                .unwrap_or_default();
+            Ok::<_, std::io::Error>(
+                rooms
+                    .into_iter()
+                    .map(|(id, member)| RecentRoom {
+                        project: projects.remove(&id),
+                        id,
+                        member,
+                    })
+                    .collect(),
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            let result = recent.await;
+            let _ = this.update(cx, |view, cx| {
+                view.loading_recent = false;
+                match result {
+                    Ok(rooms) => view.recent = Some(rooms),
+                    Err(error) => view.notice = Some(format!("读取最近联调失败。{error}").into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn connect(&mut self, request: ConnectionRequest, window: &Window, cx: &mut Context<Self>) {
-        if self.connecting {
+        if self.connecting || self.loading_recent {
             return;
         }
         let action = match &request {
             ConnectionRequest::Host(_) => "创建",
             ConnectionRequest::Join(_) => "加入",
-            ConnectionRequest::Resume => "继续",
+            ConnectionRequest::Resume(_) => "继续",
         };
         self.connecting = true;
         self.notice = None;
@@ -190,6 +240,7 @@ impl RoomView {
                 match result {
                     Ok(connection) => {
                         view.can_resume = true;
+                        view.recent = None;
                         view.invite
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         view.enter(connection, window, cx);
@@ -377,6 +428,7 @@ impl RoomView {
     fn lobby(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
         let background = cx.theme().background;
+        let busy = self.connecting || self.loading_recent;
         let card = || {
             div()
                 .flex()
@@ -399,14 +451,62 @@ impl RoomView {
             .when(self.can_resume, |view| {
                 view.child(
                     card().child(
-                        Button::new("resume-room")
-                            .label("继续上次房间")
-                            .primary()
-                            .disabled(self.connecting)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.connect(ConnectionRequest::Resume, window, cx)
-                            })),
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap_2()
+                            .child(
+                                Button::new("resume-room")
+                                    .label("继续上次房间")
+                                    .primary()
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.connect(ConnectionRequest::Resume(None), window, cx)
+                                    })),
+                            )
+                            .child(
+                                Button::new("recent-rooms")
+                                    .label(if self.recent.is_some() {
+                                        "收起最近联调"
+                                    } else {
+                                        "最近联调"
+                                    })
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|view, _, _, cx| view.toggle_recent(cx))),
+                            ),
                     ),
+                )
+            })
+            .when_some(self.recent.as_ref(), |view, rooms| {
+                view.child(
+                    card()
+                        .when(rooms.is_empty(), |view| {
+                            view.child(Label::new("暂无可继续的房间").text_sm())
+                        })
+                        .children(rooms.iter().enumerate().map(|(index, room)| {
+                            let id = room.id.clone();
+                            let short_id: String = id.chars().take(8).collect();
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_start()
+                                .gap_1()
+                                .child(
+                                    Button::new(("recent-room", index))
+                                        .label(format!("{} · 房间 {short_id}", room.member.label()))
+                                        .disabled(busy)
+                                        .on_click(cx.listener(move |view, _, window, cx| {
+                                            view.connect(
+                                                ConnectionRequest::Resume(Some(id.clone())),
+                                                window,
+                                                cx,
+                                            )
+                                        })),
+                                )
+                                .when_some(room.project.clone(), |view, project| {
+                                    view.child(Label::new(project).text_sm())
+                                })
+                        })),
                 )
             })
             .child(
@@ -424,7 +524,7 @@ impl RoomView {
                                 .map(|(index, ip)| {
                                     let button = Button::new(("address", index))
                                         .label(ip.to_string())
-                                        .disabled(self.connecting);
+                                        .disabled(busy);
                                     let button = if self.selected == Some(ip) {
                                         button.primary()
                                     } else {
@@ -441,7 +541,7 @@ impl RoomView {
                         Button::new("create-room")
                             .label("创建房间")
                             .primary()
-                            .disabled(self.selected.is_none() || self.connecting)
+                            .disabled(self.selected.is_none() || busy)
                             .on_click(cx.listener(|view, _, window, cx| {
                                 if let Some(ip) = view.selected {
                                     view.connect(ConnectionRequest::Host(ip), window, cx);
@@ -454,12 +554,12 @@ impl RoomView {
                     .child(
                         Textarea::new(&self.invite)
                             .aria_label("房间邀请")
-                            .disabled(self.connecting),
+                            .disabled(busy),
                     )
                     .child(
                         Button::new("join-room")
                             .label("加入房间")
-                            .disabled(self.connecting)
+                            .disabled(busy)
                             .on_click(cx.listener(|view, _, window, cx| {
                                 let code = view.invite.read(cx).value().trim().to_owned();
                                 view.connect(ConnectionRequest::Join(code), window, cx);
@@ -468,6 +568,9 @@ impl RoomView {
             )
             .when(self.connecting, |view| {
                 view.child(Label::new("正在连接房间").text_sm())
+            })
+            .when(self.loading_recent, |view| {
+                view.child(Label::new("正在读取最近联调").text_sm())
             })
             .children(
                 self.notice
@@ -682,7 +785,7 @@ impl RoomView {
 enum ConnectionRequest {
     Host(Ipv4Addr),
     Join(String),
-    Resume,
+    Resume(Option<String>),
 }
 
 impl ConnectionRequest {
@@ -691,7 +794,7 @@ impl ConnectionRequest {
         match self {
             Self::Host(ip) => RoomConnection::create(ip, &directory),
             Self::Join(code) => RoomConnection::join(&code, &directory),
-            Self::Resume => RoomConnection::resume(&directory),
+            Self::Resume(id) => RoomConnection::resume(&directory, id.as_deref()),
         }
     }
 }
