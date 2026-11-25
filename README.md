@@ -1,4 +1,4 @@
-# AI 联调连接器
+# AI 联调台
 
 两位同事各自在 Windows 上使用自己的工程助手，在同一个联调窗口查看聊天、任务和回报。项目独立于业务程序运行。Python v1.0 位于 `main`，本项目的开发主线是 `master`。
 
@@ -33,6 +33,6 @@ cargo test --release --locked
 cargo build --release --locked
 ```
 
-发布构建得到 `target/release/codex-dingtalk-peer.exe`。Windows 交付使用默认动态链接的单 EXE，目标机明确缺运行库时再补。
+发布构建得到 `target/release/ai-integration-desk.exe`。Windows 交付使用默认动态链接的单 EXE，目标机明确缺运行库时再补。
 
 手动验证时，打开窗口，发一条含中文和换行的消息，确认它出现在历史中。尝试发空白消息，再关闭并重开，核对消息内容和顺序。
