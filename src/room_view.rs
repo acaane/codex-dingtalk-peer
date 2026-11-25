@@ -1,4 +1,4 @@
-use std::{net::Ipv4Addr, rc::Rc, time::Duration};
+use std::{net::Ipv4Addr, path::Path, rc::Rc, time::Duration};
 
 use gpui_kit::component::{
     ActiveTheme, Disableable,
@@ -7,9 +7,12 @@ use gpui_kit::component::{
     label::Label,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
+use ring::digest::{SHA256, digest};
 
 use crate::{
     agent_view::AgentView,
+    codex,
+    readiness::{self, Id, Status},
     room::{self, Member, Outgoing, RoomClient, RoomConnection, RoomHost, RoomMessage, RoomUpdate},
     room_sessions::Sessions,
 };
@@ -29,8 +32,9 @@ pub struct RoomView {
 struct ActiveRoom {
     host: Option<(RoomHost, String)>,
     client: RoomClient,
-    room_id: String,
-    agent: Option<Entity<AgentView>>,
+    agent: Entity<AgentView>,
+    readiness: Option<readiness::Update>,
+    probe: Option<LocalProbe>,
     show_agent: bool,
     member: Member,
     connected: bool,
@@ -40,6 +44,95 @@ struct ActiveRoom {
     pending: Option<Outgoing>,
     queued: bool,
     sending: bool,
+}
+
+struct LocalProbe {
+    binding: Option<room::Secret>,
+    id: Id,
+    started: bool,
+    retry: bool,
+    result: Option<readiness::Report>,
+}
+
+impl ActiveRoom {
+    fn readiness_request(&mut self, cx: &App) -> Option<readiness::Request> {
+        let binding = self
+            .agent
+            .read(cx)
+            .binding()?
+            .map(|binding| binding_key(&binding.thread_id));
+        if self
+            .probe
+            .as_ref()
+            .is_none_or(|probe| probe.binding != binding)
+        {
+            self.probe = Some(LocalProbe {
+                binding,
+                id: room::random().ok()?,
+                started: false,
+                retry: false,
+                result: None,
+            });
+        }
+        let probe = self.probe.as_ref()?;
+        Some(readiness::Request {
+            binding,
+            attempt: probe.id,
+            retry: probe.retry,
+            result: probe.result,
+        })
+    }
+
+    fn start_probe(&mut self, challenge: Id, cx: &mut Context<RoomView>) {
+        let Some(probe) = self.probe.as_mut().filter(|probe| !probe.started) else {
+            return;
+        };
+        let Some(binding) = self.agent.read(cx).binding().flatten().cloned() else {
+            return;
+        };
+        if probe.binding != Some(binding_key(&binding.thread_id)) {
+            return;
+        }
+        probe.started = true;
+        probe.retry = false;
+        let attempt = probe.id;
+        let job = cx.background_executor().spawn(async move {
+            codex::verify_session(Path::new(&binding.project), &binding.thread_id, challenge)
+        });
+        cx.spawn(async move |view, cx| {
+            let answer = job.await;
+            let _ = view.update(cx, |view, _| {
+                if let Some(probe) = view
+                    .active
+                    .as_mut()
+                    .and_then(|room| room.probe.as_mut())
+                    .filter(|probe| probe.id == attempt)
+                {
+                    probe.result = Some(readiness::Report { challenge, answer });
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+fn binding_key(thread: &str) -> room::Secret {
+    let mut key = [0; 32];
+    key.copy_from_slice(digest(&SHA256, thread.as_bytes()).as_ref());
+    key
+}
+
+fn readiness_label(member: Member, status: Status) -> String {
+    let label = match status {
+        Status::Unbound => "等待绑定 Codex 会话",
+        Status::Waiting => "等待双方绑定",
+        Status::Running => "正在验证接单",
+        Status::Passed => "接单验证通过",
+        Status::Failed(reason) => {
+            return format!("{} · 验证失败。{}", member.label(), reason.label());
+        }
+    };
+    format!("{} · {label}", member.label())
 }
 
 impl RoomView {
@@ -113,11 +206,13 @@ impl RoomView {
         };
         let list = ListState::new(0, ListAlignment::Bottom, px(240.));
         list.set_follow_mode(FollowMode::Tail);
+        let agent = cx.new(|cx| AgentView::new(connection.room_id, cx));
         self.active = Some(ActiveRoom {
             host: connection.host,
             client: connection.client,
-            room_id: connection.room_id,
-            agent: None,
+            agent,
+            readiness: None,
+            probe: None,
             show_agent: false,
             member,
             connected: connection.ready,
@@ -130,8 +225,8 @@ impl RoomView {
         });
         self.sync = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
-                let Ok(Some((client, cursor, outgoing, pending))) =
-                    this.update_in(cx, |view, _, _| {
+                let Ok(Some((client, cursor, outgoing, pending, readiness))) =
+                    this.update_in(cx, |view, _, cx| {
                         let room = view.active.as_mut()?;
                         let outgoing = if std::mem::take(&mut room.queued) {
                             room.pending.clone()
@@ -143,6 +238,7 @@ impl RoomView {
                             room.messages.last().map_or(0, |msg| msg.id),
                             outgoing,
                             room.pending.clone(),
+                            room.readiness_request(cx),
                         ))
                     })
                 else {
@@ -151,7 +247,14 @@ impl RoomView {
                 let sent = outgoing.is_some();
                 let response = cx
                     .background_executor()
-                    .spawn(async move { client.exchange(cursor, outgoing, pending.as_ref()) })
+                    .spawn(async move {
+                        client.exchange_with_readiness(
+                            cursor,
+                            outgoing,
+                            pending.as_ref(),
+                            readiness,
+                        )
+                    })
                     .await;
                 if this
                     .update_in(cx, |view, window, cx| {
@@ -183,8 +286,13 @@ impl RoomView {
         match result {
             Ok(update) => {
                 let changed = previously_connected != room.connected
-                    || room.guest_joined != update.guest_joined;
+                    || room.guest_joined != update.guest_joined
+                    || room.readiness != update.readiness;
                 room.guest_joined = update.guest_joined;
+                room.readiness = update.readiness;
+                if let Some(challenge) = update.readiness.and_then(|ready| ready.challenge) {
+                    room.start_probe(challenge, cx);
+                }
                 let count = update.messages.len();
                 if count != 0 {
                     let end = room.messages.len();
@@ -407,10 +515,6 @@ impl RoomView {
                             let Some(room) = view.active.as_mut() else {
                                 return;
                             };
-                            if room.agent.is_none() {
-                                let id = room.room_id.clone();
-                                room.agent = Some(cx.new(|cx| AgentView::new(id, cx)));
-                            }
                             room.show_agent = !room.show_agent;
                             cx.notify();
                         })),
@@ -427,13 +531,53 @@ impl RoomView {
                             cx.notify();
                         })),
                 );
-        if let Some(agent) = room.agent.as_ref().filter(|_| room.show_agent) {
+        let status = div()
+            .flex()
+            .items_center()
+            .flex_wrap()
+            .gap_3()
+            .px_4()
+            .py_2()
+            .bg(background)
+            .border_b_1()
+            .border_color(border)
+            .when_some(room.readiness.filter(|_| room.connected), |view, update| {
+                view.child(Label::new(readiness_label(Member::Host, update.host)).text_sm())
+                    .child(Label::new(readiness_label(Member::Guest, update.guest)).text_sm())
+                    .when(matches!(update.status(member), Status::Failed(_)), |view| {
+                        view.child(
+                            Button::new("retry-readiness")
+                                .label("重试本端验证")
+                                .disabled(room.probe.as_ref().is_some_and(|probe| probe.retry))
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Some(probe) =
+                                        view.active.as_mut().and_then(|room| room.probe.as_mut())
+                                    {
+                                        match room::random() {
+                                            Ok(id) => {
+                                                probe.id = id;
+                                                probe.result = None;
+                                                probe.started = false;
+                                                probe.retry = true;
+                                            }
+                                            Err(error) => {
+                                                view.notice = Some(error.to_string().into())
+                                            }
+                                        }
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    })
+            });
+        if room.show_agent {
             return div()
                 .size_full()
                 .flex()
                 .flex_col()
                 .child(header)
-                .child(div().flex_1().min_h_0().child(agent.clone()))
+                .child(status)
+                .child(div().flex_1().min_h_0().child(room.agent.clone()))
                 .into_any_element();
         }
         let input = div()
@@ -474,6 +618,7 @@ impl RoomView {
             .flex()
             .flex_col()
             .child(header)
+            .child(status)
             .child(history)
             .child(input)
             .into_any_element()

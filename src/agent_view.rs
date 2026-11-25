@@ -19,6 +19,7 @@ enum ProjectAction {
 pub struct AgentView {
     room_id: String,
     saved: Option<Binding>,
+    binding_loaded: bool,
     project: Option<PathBuf>,
     candidates: Vec<codex::Candidate>,
     status: Option<SharedString>,
@@ -39,7 +40,10 @@ impl AgentView {
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
                 match result {
-                    Ok(binding) => view.saved = binding,
+                    Ok(binding) => {
+                        view.saved = binding;
+                        view.binding_loaded = true;
+                    }
                     Err(error) => view.status = Some(format!("读取本机绑定失败。{error}").into()),
                 }
                 cx.notify();
@@ -49,11 +53,16 @@ impl AgentView {
         Self {
             room_id,
             saved: None,
+            binding_loaded: false,
             project: None,
             candidates: Vec::new(),
             status: None,
             busy: true,
         }
+    }
+
+    pub fn binding(&self) -> Option<Option<&Binding>> {
+        self.binding_loaded.then_some(self.saved.as_ref())
     }
 
     fn choose_project(&mut self, action: ProjectAction, cx: &mut Context<Self>) {
@@ -159,6 +168,7 @@ impl AgentView {
                 match result {
                     Ok(binding) => {
                         view.saved = Some(binding);
+                        view.binding_loaded = true;
                         view.project = None;
                         view.candidates.clear();
                         view.status = None;

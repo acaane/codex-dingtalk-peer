@@ -4,6 +4,7 @@ use sqlx::{Connection, SqliteConnection};
 
 use crate::{codex, storage};
 
+#[derive(Clone)]
 pub struct Binding {
     pub project: String,
     pub thread_id: String,
