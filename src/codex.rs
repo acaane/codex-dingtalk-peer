@@ -123,8 +123,39 @@ fn executable() -> io::Result<PathBuf> {
 }
 
 pub fn verify_session(project: &Path, thread: &str, challenge: Id) -> Result<Id, Failure> {
-    let mut server = AppServer::connect(project, PROBE_TIMEOUT)
-        .map_err(|error| classify(error, Failure::Session))?;
+    let code = format!("PROBE-{}", URL_SAFE_NO_PAD.encode(challenge));
+    let prompt = format!(
+        "这是 AI 联调台的只读接单验证。请不要读取文件、运行命令或调用工具。只原样回复以下一行（不要加引号）：{code}"
+    );
+    let answer = run_readonly(project, thread, &prompt, PROBE_TIMEOUT)?;
+    if answer.trim() != code {
+        return Err(Failure::Reply);
+    }
+    Ok(challenge)
+}
+
+pub fn run_task(
+    project: &Path,
+    thread: &str,
+    goal: &str,
+    id: Id,
+    timeout: Duration,
+) -> Result<String, Failure> {
+    let id = URL_SAFE_NO_PAD.encode(id);
+    let prompt = format!(
+        "请执行 AI 联调台派给本会话的只读联调任务 {id}。范围限当前绑定工程。\n+         仅做只读检查。不要修改文件、启停业务服务、操作设备或联系外部系统。\n+         目标需要额外权限时请描述阻塞。最终用中文回报发现、证据和未完成项，勿回传凭据或秘密。\n\n+         本次任务目标：\n{goal}"
+    );
+    run_readonly(project, thread, &prompt, timeout).map(crate::tasks::bounded_report)
+}
+
+fn run_readonly(
+    project: &Path,
+    thread: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, Failure> {
+    let mut server =
+        AppServer::connect(project, timeout).map_err(|error| classify(error, Failure::Session))?;
     let resumed = server
         .call(
             "thread/resume",
@@ -140,19 +171,19 @@ pub fn verify_session(project: &Path, thread: &str, challenge: Id) -> Result<Id,
     if resumed["thread"]["status"]["type"] == "active" {
         return Err(Failure::Busy);
     }
-    let code = format!("PROBE-{}", URL_SAFE_NO_PAD.encode(challenge));
-    let started = server.call(
-        "turn/start",
-        json!({
-            "threadId": thread,
-            "input": [{"type": "text", "text": format!("这是 AI 联调台的只读接单验证。请不要读取文件、运行命令或调用工具。只原样回复以下一行（不要加引号）：{code}"), "text_elements": []}],
-            "approvalPolicy": "never",
-            "sandboxPolicy": {"type": "readOnly", "networkAccess": false}
-        }),
-    ).map_err(|error| classify(error, Failure::Model))?;
+    let started = server
+        .call(
+            "turn/start",
+            json!({
+                "threadId": thread,
+                "input": [{"type": "text", "text": prompt, "text_elements": []}],
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "readOnly", "networkAccess": false}
+            }),
+        )
+        .map_err(|error| classify(error, Failure::Model))?;
     let turn = started["turn"]["id"].as_str().ok_or(Failure::Model)?;
-    server.verify_turn(thread, turn, &code)?;
-    Ok(challenge)
+    server.completed_answer(thread, turn)
 }
 
 fn classify(error: io::Error, stage: Failure) -> Failure {
@@ -173,6 +204,7 @@ pub struct AppServer {
 
 impl AppServer {
     pub fn connect(project: &Path, timeout: Duration) -> io::Result<Self> {
+        let deadline = Instant::now() + timeout;
         let mut process = Command::new(executable()?)
             .args(["app-server", "--listen", "stdio://"])
             .current_dir(project)
@@ -201,7 +233,7 @@ impl AppServer {
             process,
             replies,
             seq: 0,
-            deadline: Instant::now() + timeout,
+            deadline,
             events: VecDeque::new(),
         };
         server.call(
@@ -238,6 +270,12 @@ impl AppServer {
     }
 
     fn call(&mut self, method: &str, params: Value) -> io::Result<Value> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "等待 Codex 响应超时",
+            ));
+        }
         self.seq += 1;
         let id = self.seq;
         self.send(json!({"method": method, "id": id, "params": params}))?;
@@ -286,8 +324,8 @@ impl AppServer {
         Ok(message)
     }
 
-    fn verify_turn(&mut self, thread: &str, turn: &str, expected: &str) -> Result<(), Failure> {
-        let mut matched = false;
+    fn completed_answer(&mut self, thread: &str, turn: &str) -> Result<String, Failure> {
+        let mut answer = None;
         loop {
             let message = match self
                 .events
@@ -309,16 +347,17 @@ impl AppServer {
                 Some("item/completed") if params["turnId"].as_str() == Some(turn) => {
                     let item = &params["item"];
                     if item["type"] == "agentMessage" && item["phase"] != "commentary" {
-                        matched = item["text"]
+                        answer = item["text"]
                             .as_str()
-                            .is_some_and(|text| text.trim() == expected);
+                            .filter(|text| !text.trim().is_empty())
+                            .map(str::to_owned);
                     }
                 }
                 Some("turn/completed") if params["turn"]["id"].as_str() == Some(turn) => {
                     if params["turn"]["status"] != "completed" {
                         return Err(Failure::Model);
                     }
-                    return matched.then_some(()).ok_or(Failure::Reply);
+                    return answer.ok_or(Failure::Reply);
                 }
                 _ => {}
             }

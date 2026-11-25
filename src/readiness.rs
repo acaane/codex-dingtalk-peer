@@ -112,6 +112,13 @@ pub struct State {
 }
 
 impl State {
+    pub fn verified_bindings(&self) -> Option<[Secret; 2]> {
+        if self.host.phase == Phase::Passed && self.guest.phase == Phase::Passed {
+            return Some([self.host.binding?, self.guest.binding?]);
+        }
+        None
+    }
+
     pub fn apply(&mut self, member: Member, request: Request, now: u64) -> io::Result<Update> {
         for participant in [&mut self.host, &mut self.guest] {
             if let Phase::Running {
