@@ -9,6 +9,8 @@ mod room;
 mod room_sessions;
 mod room_view;
 mod storage;
+mod task_view;
+mod tasks;
 mod ui;
 
 use std::error::Error;

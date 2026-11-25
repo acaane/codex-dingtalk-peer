@@ -22,6 +22,7 @@ use subtle::ConstantTimeEq;
 
 use crate::readiness;
 use crate::room_sessions::Sessions;
+use crate::tasks;
 
 const SERVER_NAME: &str = "codex-room.local";
 const INVITE_PREFIX: &str = "cdp-room-1.";
@@ -134,6 +135,8 @@ enum Request {
         check: Option<MessageId>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         readiness: Option<readiness::Request>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task: Option<tasks::Request>,
     },
 }
 
@@ -151,6 +154,8 @@ pub struct RoomUpdate {
     pub confirmed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness: Option<readiness::Update>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<tasks::Update>,
 }
 
 #[derive(Clone)]
@@ -200,12 +205,24 @@ impl RoomClient {
         self.exchange_with_readiness(after, outgoing, pending, None)
     }
 
+    #[cfg(test)]
     pub fn exchange_with_readiness(
         &self,
         after: i64,
         outgoing: Option<Outgoing>,
         pending: Option<&Outgoing>,
         readiness: Option<readiness::Request>,
+    ) -> io::Result<RoomUpdate> {
+        self.exchange_room(after, outgoing, pending, readiness, None)
+    }
+
+    pub fn exchange_room(
+        &self,
+        after: i64,
+        outgoing: Option<Outgoing>,
+        pending: Option<&Outgoing>,
+        readiness: Option<readiness::Request>,
+        task: Option<tasks::Request>,
     ) -> io::Result<RoomUpdate> {
         let check = pending.or(outgoing.as_ref()).map(|message| message.id);
         let request = Request::Exchange {
@@ -214,6 +231,7 @@ impl RoomClient {
             outgoing,
             check,
             readiness,
+            task,
         };
         match self.request(request)? {
             Reply::Update(update) => Ok(update),
@@ -500,6 +518,7 @@ impl ServerRoom {
                 outgoing,
                 check,
                 readiness,
+                task,
             } => {
                 let role =
                     if bool::from(self.owner.ct_eq(&member)) {
@@ -518,6 +537,7 @@ impl ServerRoom {
                 {
                     return Reply::Rejected("消息内容或读取位置不合法".into());
                 }
+                let advertised = readiness.and_then(|request| request.binding);
                 let readiness = match readiness
                     .map(|request| self.update_readiness(role, request))
                     .transpose()
@@ -525,12 +545,31 @@ impl ServerRoom {
                     Ok(update) => update,
                     Err(_) => return Reply::Rejected("主机暂时无法保存接单状态".into()),
                 };
+                let task = if let Some(task) = task {
+                    let Ok(timestamp) = now() else {
+                        return Reply::Rejected("主机系统时间异常".into());
+                    };
+                    match block_on(tasks::apply(
+                        &mut self.store,
+                        role,
+                        task.action,
+                        self.readiness.verified_bindings(),
+                        advertised,
+                        timestamp,
+                    )) {
+                        Ok(update) => Some(update),
+                        Err(_) => return Reply::Rejected("主机暂时无法保存或读取任务".into()),
+                    }
+                } else {
+                    None
+                };
                 match block_on(exchange_room(&mut self.store, role, after, outgoing, check)) {
                     Ok((messages, confirmed)) => Reply::Update(RoomUpdate {
                         messages,
                         confirmed,
                         guest_joined: self.guest.is_some(),
                         readiness,
+                        task,
                     }),
                     Err(_) => Reply::Rejected("主机暂时无法保存或读取房间消息".into()),
                 }
@@ -588,6 +627,7 @@ async fn open_room(path: &Path) -> sqlx::Result<SqliteConnection> {
     )
     .execute(&mut store)
     .await?;
+    tasks::initialize(&mut store).await?;
     Ok(store)
 }
 

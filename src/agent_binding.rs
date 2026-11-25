@@ -12,6 +12,14 @@ pub struct Binding {
 }
 
 impl Binding {
+    pub fn fingerprint(&self) -> crate::room::Secret {
+        use ring::digest::{SHA256, digest};
+
+        let mut key = [0; 32];
+        key.copy_from_slice(digest(&SHA256, self.thread_id.as_bytes()).as_ref());
+        key
+    }
+
     pub async fn load(directory: &Path, room_id: &str) -> sqlx::Result<Option<Self>> {
         let mut db = open_bindings(directory).await?;
         Self::load_from(&mut db, room_id).await

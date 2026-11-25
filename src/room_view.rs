@@ -1,4 +1,9 @@
-use std::{net::Ipv4Addr, path::Path, rc::Rc, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    path::Path,
+    rc::Rc,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::component::{
     ActiveTheme, Disableable,
@@ -7,7 +12,6 @@ use gpui_kit::component::{
     label::Label,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
-use ring::digest::{SHA256, digest};
 
 use crate::{
     agent_view::AgentView,
@@ -15,6 +19,7 @@ use crate::{
     readiness::{self, Id, Status},
     room::{self, Member, Outgoing, RoomClient, RoomConnection, RoomHost, RoomMessage, RoomUpdate},
     room_sessions::Sessions,
+    task_view::TaskView,
 };
 
 pub struct RoomView {
@@ -33,9 +38,10 @@ struct ActiveRoom {
     host: Option<(RoomHost, String)>,
     client: RoomClient,
     agent: Entity<AgentView>,
+    tasks: Entity<TaskView>,
     readiness: Option<readiness::Update>,
     probe: Option<LocalProbe>,
-    show_agent: bool,
+    panel: Panel,
     member: Member,
     connected: bool,
     guest_joined: bool,
@@ -44,6 +50,13 @@ struct ActiveRoom {
     pending: Option<Outgoing>,
     queued: bool,
     sending: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Panel {
+    Chat,
+    Agent,
+    Tasks,
 }
 
 struct LocalProbe {
@@ -60,7 +73,7 @@ impl ActiveRoom {
             .agent
             .read(cx)
             .binding()?
-            .map(|binding| binding_key(&binding.thread_id));
+            .map(|binding| binding.fingerprint());
         if self
             .probe
             .as_ref()
@@ -90,7 +103,7 @@ impl ActiveRoom {
         let Some(binding) = self.agent.read(cx).binding().flatten().cloned() else {
             return;
         };
-        if probe.binding != Some(binding_key(&binding.thread_id)) {
+        if probe.binding != Some(binding.fingerprint()) {
             return;
         }
         probe.started = true;
@@ -114,12 +127,6 @@ impl ActiveRoom {
         })
         .detach();
     }
-}
-
-fn binding_key(thread: &str) -> room::Secret {
-    let mut key = [0; 32];
-    key.copy_from_slice(digest(&SHA256, thread.as_bytes()).as_ref());
-    key
 }
 
 fn readiness_label(member: Member, status: Status) -> String {
@@ -198,7 +205,7 @@ impl RoomView {
         cx.notify();
     }
 
-    fn enter(&mut self, connection: RoomConnection, window: &Window, cx: &mut Context<Self>) {
+    fn enter(&mut self, connection: RoomConnection, window: &mut Window, cx: &mut Context<Self>) {
         let member = if connection.host.is_some() {
             Member::Host
         } else {
@@ -206,14 +213,16 @@ impl RoomView {
         };
         let list = ListState::new(0, ListAlignment::Bottom, px(240.));
         list.set_follow_mode(FollowMode::Tail);
-        let agent = cx.new(|cx| AgentView::new(connection.room_id, cx));
+        let agent = cx.new(|cx| AgentView::new(connection.room_id.clone(), cx));
+        let tasks = cx.new(|cx| TaskView::new(connection.room_id, member, window, cx));
         self.active = Some(ActiveRoom {
             host: connection.host,
             client: connection.client,
             agent,
+            tasks,
             readiness: None,
             probe: None,
-            show_agent: false,
+            panel: Panel::Chat,
             member,
             connected: connection.ready,
             guest_joined: member == Member::Guest,
@@ -225,40 +234,47 @@ impl RoomView {
         });
         self.sync = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
-                let Ok(Some((client, cursor, outgoing, pending, readiness))) =
-                    this.update_in(cx, |view, _, cx| {
+                let Ok(Some((client, cursor, outgoing, pending, readiness, task))) = this
+                    .update_in(cx, |view, _, cx| {
                         let room = view.active.as_mut()?;
                         let outgoing = if std::mem::take(&mut room.queued) {
                             room.pending.clone()
                         } else {
                             None
                         };
+                        let readiness = room.readiness_request(cx);
+                        let task = room.tasks.update(cx, |tasks, _| {
+                            tasks.request(readiness.and_then(|request| request.binding))
+                        });
                         Some((
                             room.client.clone(),
                             room.messages.last().map_or(0, |msg| msg.id),
                             outgoing,
                             room.pending.clone(),
-                            room.readiness_request(cx),
+                            readiness,
+                            task,
                         ))
                     })
                 else {
                     break;
                 };
                 let sent = outgoing.is_some();
+                let sent_at = Instant::now();
                 let response = cx
                     .background_executor()
                     .spawn(async move {
-                        client.exchange_with_readiness(
+                        client.exchange_room(
                             cursor,
                             outgoing,
                             pending.as_ref(),
                             readiness,
+                            Some(task),
                         )
                     })
                     .await;
                 if this
                     .update_in(cx, |view, window, cx| {
-                        view.receive(response, sent, window, cx)
+                        view.receive(response, sent, sent_at, window, cx)
                     })
                     .is_err()
                 {
@@ -275,6 +291,7 @@ impl RoomView {
         &mut self,
         result: std::io::Result<RoomUpdate>,
         sent: bool,
+        sent_at: Instant,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -283,6 +300,9 @@ impl RoomView {
         };
         let previously_connected = room.connected;
         room.connected = result.is_ok();
+        if !room.connected {
+            room.tasks.update(cx, |tasks, cx| tasks.disconnected(cx));
+        }
         match result {
             Ok(update) => {
                 let changed = previously_connected != room.connected
@@ -293,6 +313,18 @@ impl RoomView {
                 if let Some(challenge) = update.readiness.and_then(|ready| ready.challenge) {
                     room.start_probe(challenge, cx);
                 }
+                let task_ready = update.readiness.is_some_and(|ready| {
+                    ready.host == Status::Passed && ready.guest == Status::Passed
+                });
+                let binding = update
+                    .task
+                    .as_ref()
+                    .and_then(|task| task.grant)
+                    .and_then(|_| room.agent.read(cx).binding().flatten())
+                    .cloned();
+                room.tasks.update(cx, |tasks, cx| {
+                    tasks.receive(update.task, task_ready, binding, sent_at, window, cx)
+                });
                 let count = update.messages.len();
                 if count != 0 {
                     let end = room.messages.len();
@@ -506,7 +538,7 @@ impl RoomView {
                 )
                 .child(
                     Button::new("codex-agent")
-                        .label(if room.show_agent {
+                        .label(if room.panel == Panel::Agent {
                             "返回房间聊天"
                         } else {
                             "Codex 会话"
@@ -515,8 +547,30 @@ impl RoomView {
                             let Some(room) = view.active.as_mut() else {
                                 return;
                             };
-                            room.show_agent = !room.show_agent;
+                            room.panel = if room.panel == Panel::Agent {
+                                Panel::Chat
+                            } else {
+                                Panel::Agent
+                            };
                             cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("room-task-panel")
+                        .label(if room.panel == Panel::Tasks {
+                            "返回房间聊天"
+                        } else {
+                            "联调任务"
+                        })
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            if let Some(room) = view.active.as_mut() {
+                                room.panel = if room.panel == Panel::Tasks {
+                                    Panel::Chat
+                                } else {
+                                    Panel::Tasks
+                                };
+                                cx.notify();
+                            }
                         })),
                 )
                 .child(
@@ -570,14 +624,19 @@ impl RoomView {
                         )
                     })
             });
-        if room.show_agent {
+        let panel = match room.panel {
+            Panel::Chat => None,
+            Panel::Agent => Some(room.agent.clone().into_any_element()),
+            Panel::Tasks => Some(room.tasks.clone().into_any_element()),
+        };
+        if let Some(panel) = panel {
             return div()
                 .size_full()
                 .flex()
                 .flex_col()
                 .child(header)
                 .child(status)
-                .child(div().flex_1().min_h_0().child(room.agent.clone()))
+                .child(div().flex_1().min_h_0().child(panel))
                 .into_any_element();
         }
         let input = div()
