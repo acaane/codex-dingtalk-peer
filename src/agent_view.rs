@@ -3,68 +3,17 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::{agent_binding::Binding, codex, storage};
 use gpui_kit::component::{
     ActiveTheme, Disableable,
     button::{Button, ButtonVariants},
     label::Label,
 };
 use gpui_kit::{prelude::FluentBuilder, *};
-use sqlx::SqliteConnection;
 
-use crate::{codex, storage};
-
-struct Binding {
-    project: String,
-    thread_id: String,
-    label: String,
-}
-
-async fn open_bindings(directory: &Path) -> sqlx::Result<SqliteConnection> {
-    let mut db = storage::connect(&directory.join("agent-bindings.sqlite3")).await?;
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS agent_bindings (
-            room_id TEXT PRIMARY KEY,
-            project TEXT NOT NULL,
-            thread_id TEXT NOT NULL,
-            label TEXT NOT NULL
-        )",
-    )
-    .execute(&mut db)
-    .await?;
-    Ok(db)
-}
-
-impl Binding {
-    async fn load(directory: &Path, room_id: &str) -> sqlx::Result<Option<Self>> {
-        let mut db = open_bindings(directory).await?;
-        let saved: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT project, thread_id, label FROM agent_bindings WHERE room_id = ?1",
-        )
-        .bind(room_id)
-        .fetch_optional(&mut db)
-        .await?;
-        Ok(saved.map(|(project, thread_id, label)| Self {
-            project,
-            thread_id,
-            label,
-        }))
-    }
-
-    async fn save(&self, directory: &Path, room_id: &str) -> sqlx::Result<()> {
-        let mut db = open_bindings(directory).await?;
-        sqlx::query(
-            "INSERT INTO agent_bindings (room_id, project, thread_id, label) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(room_id) DO UPDATE SET
-                project = excluded.project, thread_id = excluded.thread_id, label = excluded.label",
-        )
-        .bind(room_id)
-        .bind(&self.project)
-        .bind(&self.thread_id)
-        .bind(&self.label)
-        .execute(&mut db)
-        .await?;
-        Ok(())
-    }
+enum ProjectAction {
+    Bind,
+    List,
 }
 
 pub struct AgentView {
@@ -90,10 +39,7 @@ impl AgentView {
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
                 match result {
-                    Ok(binding) => {
-                        view.project = binding.as_ref().map(|saved| PathBuf::from(&saved.project));
-                        view.saved = binding;
-                    }
+                    Ok(binding) => view.saved = binding,
                     Err(error) => view.status = Some(format!("读取本机绑定失败。{error}").into()),
                 }
                 cx.notify();
@@ -110,7 +56,7 @@ impl AgentView {
         }
     }
 
-    fn choose_project(&mut self, cx: &mut Context<Self>) {
+    fn choose_project(&mut self, action: ProjectAction, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
             directories: true,
             files: false,
@@ -125,7 +71,10 @@ impl AgentView {
                 match selection {
                     Ok(Ok(Some(paths))) => {
                         if let Some(path) = paths.into_iter().next() {
-                            view.search(path, cx);
+                            match action {
+                                ProjectAction::Bind => view.bind_project(path, cx),
+                                ProjectAction::List => view.search(path, cx),
+                            }
                         }
                     }
                     Ok(Err(_)) => view.status = Some("无法打开工程目录选择器".into()),
@@ -136,6 +85,18 @@ impl AgentView {
         })
         .detach();
         cx.notify();
+    }
+
+    fn bind_project(&mut self, project: PathBuf, cx: &mut Context<Self>) {
+        self.project = None;
+        self.candidates.clear();
+        self.status = Some("正在准备本机协调会话".into());
+        let room_id = self.room_id.clone();
+        let pending = cx.background_executor().spawn(async move {
+            let directory = storage::data_directory()?;
+            Binding::ensure(&directory, &room_id, &project).await
+        });
+        self.update_binding(pending, cx);
     }
 
     fn search(&mut self, project: PathBuf, cx: &mut Context<Self>) {
@@ -151,9 +112,9 @@ impl AgentView {
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
                 view.status = match result {
-                    Ok(candidates) if candidates.is_empty() => {
-                        Some("该目录没有可绑定的会话。请在 Codex 打开对应工程后刷新。".into())
-                    }
+                    Ok(candidates) if candidates.is_empty() => Some(
+                        "该目录没有可绑定的会话。可通过「选择工程并绑定」创建协调会话。".into(),
+                    ),
                     Ok(candidates) => {
                         view.candidates = candidates;
                         None
@@ -176,7 +137,6 @@ impl AgentView {
             thread_id: candidate.id.clone(),
             label: candidate.label(),
         };
-        self.busy = true;
         self.status = Some("正在保存本机绑定".into());
         let room_id = self.room_id.clone();
         let save = cx.background_executor().spawn(async move {
@@ -187,6 +147,11 @@ impl AgentView {
                 .map_err(io::Error::other)?;
             Ok::<_, io::Error>(binding)
         });
+        self.update_binding(save, cx);
+    }
+
+    fn update_binding(&mut self, save: Task<io::Result<Binding>>, cx: &mut Context<Self>) {
+        self.busy = true;
         cx.spawn(async move |this, cx| {
             let result = save.await;
             let _ = this.update(cx, |view, cx| {
@@ -194,10 +159,11 @@ impl AgentView {
                 match result {
                     Ok(binding) => {
                         view.saved = Some(binding);
+                        view.project = None;
                         view.candidates.clear();
                         view.status = None;
                     }
-                    Err(error) => view.status = Some(format!("保存绑定失败。{error}").into()),
+                    Err(error) => view.status = Some(format!("绑定失败。{error}").into()),
                 }
                 cx.notify();
             });
@@ -218,7 +184,6 @@ impl Render for AgentView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(Label::new("请在 Codex 中打开当前联调工程的会话，再选择该工程目录。").text_sm())
             .when_some(self.saved.as_ref(), |panel, binding| {
                 panel
                     .child(Label::new(format!("已绑定 {}", binding.label)).text_sm())
@@ -228,13 +193,24 @@ impl Render for AgentView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         Button::new("choose-project")
-                            .label("选择工程目录")
+                            .label("选择工程并绑定")
                             .primary()
                             .disabled(self.busy)
-                            .on_click(cx.listener(|view, _, _, cx| view.choose_project(cx))),
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.choose_project(ProjectAction::Bind, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("choose-existing-session")
+                            .label("选择已有会话")
+                            .disabled(self.busy)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.choose_project(ProjectAction::List, cx)
+                            })),
                     )
                     .when_some(project, |actions, project| {
                         actions.child(
