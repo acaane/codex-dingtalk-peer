@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const LIST_TIMEOUT: Duration = Duration::from_secs(12);
+pub const COORDINATOR_NAME: &str = "AI 联调台协调会话";
 
 #[derive(Clone, Deserialize)]
 pub struct Candidate {
@@ -44,13 +45,7 @@ struct Page {
 
 pub fn project_sessions(project: &Path) -> io::Result<Vec<Candidate>> {
     let directory = project.canonicalize()?;
-    let executable = executable()?;
-    let mut server = AppServer::start(&executable, project)?;
-    server.call(
-        "initialize",
-        json!({"clientInfo": {"name": "ai_integration_desk", "version": env!("CARGO_PKG_VERSION")}}),
-    )?;
-    server.send(json!({"method": "initialized"}))?;
+    let mut server = AppServer::connect(project, LIST_TIMEOUT)?;
 
     let mut candidates = Vec::new();
     let mut cursor: Option<String> = None;
@@ -122,7 +117,7 @@ fn executable() -> io::Result<PathBuf> {
     ))
 }
 
-struct AppServer {
+pub struct AppServer {
     process: Child,
     replies: Receiver<Value>,
     seq: u64,
@@ -130,8 +125,8 @@ struct AppServer {
 }
 
 impl AppServer {
-    fn start(executable: &Path, project: &Path) -> io::Result<Self> {
-        let mut process = Command::new(executable)
+    pub fn connect(project: &Path, timeout: Duration) -> io::Result<Self> {
+        let mut process = Command::new(executable()?)
             .args(["app-server", "--listen", "stdio://"])
             .current_dir(project)
             .creation_flags(CREATE_NO_WINDOW)
@@ -151,12 +146,36 @@ impl AppServer {
                 }
             }
         });
-        Ok(Self {
+        let mut server = Self {
             process,
             replies,
             seq: 0,
-            deadline: Instant::now() + LIST_TIMEOUT,
-        })
+            deadline: Instant::now() + timeout,
+        };
+        server.call(
+            "initialize",
+            json!({"clientInfo": {"name": "ai_integration_desk", "version": env!("CARGO_PKG_VERSION")}}),
+        )?;
+        server.send(json!({"method": "initialized"}))?;
+        Ok(server)
+    }
+
+    pub fn create_coordinator(&mut self, project: &Path) -> io::Result<String> {
+        let started = self.call(
+            "thread/start",
+            json!({"cwd": project, "ephemeral": false, "sandbox": "read-only"}),
+        )?;
+        let id = started["thread"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| io::Error::other("Codex 未返回新会话编号"))?;
+        // Naming persists the empty session so it can be resumed before its first turn.
+        self.call(
+            "thread/name/set",
+            json!({"threadId": id, "name": COORDINATOR_NAME}),
+        )
+        .map_err(io::Error::other)?;
+        Ok(id.to_owned())
     }
 
     fn send(&mut self, message: Value) -> io::Result<()> {
@@ -173,13 +192,18 @@ impl AppServer {
         loop {
             let left = self.deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(io::Error::other("查询 Codex 会话超时"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "等待 Codex 响应超时",
+                ));
             }
             let mut message = self
                 .replies
                 .recv_timeout(left)
                 .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => io::Error::other("查询 Codex 会话超时"),
+                    mpsc::RecvTimeoutError::Timeout => {
+                        io::Error::new(io::ErrorKind::TimedOut, "等待 Codex 响应超时")
+                    }
                     mpsc::RecvTimeoutError::Disconnected => {
                         io::Error::other("Codex 后台进程已退出")
                     }
@@ -190,10 +214,16 @@ impl AppServer {
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
+            if message.get("error").is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("本机 Codex 接口 {method} 拒绝了请求"),
+                ));
+            }
             return message
                 .get_mut("result")
                 .map(Value::take)
-                .ok_or_else(|| io::Error::other(format!("本机 Codex 接口 {method} 查询失败")));
+                .ok_or_else(|| io::Error::other(format!("本机 Codex 接口 {method} 回执缺少结果")));
         }
     }
 }
