@@ -9,6 +9,7 @@ use gpui_kit::component::{
 use gpui_kit::{prelude::FluentBuilder, *};
 
 use crate::{
+    agent_view::AgentView,
     room::{self, Member, Outgoing, RoomClient, RoomConnection, RoomHost, RoomMessage, RoomUpdate},
     room_sessions::Sessions,
 };
@@ -28,6 +29,9 @@ pub struct RoomView {
 struct ActiveRoom {
     host: Option<(RoomHost, String)>,
     client: RoomClient,
+    room_id: String,
+    agent: Option<Entity<AgentView>>,
+    show_agent: bool,
     member: Member,
     connected: bool,
     guest_joined: bool,
@@ -112,6 +116,9 @@ impl RoomView {
         self.active = Some(ActiveRoom {
             host: connection.host,
             client: connection.client,
+            room_id: connection.room_id,
+            agent: None,
+            show_agent: false,
             member,
             connected: connection.ready,
             guest_joined: member == Member::Guest,
@@ -390,6 +397,25 @@ impl RoomView {
                     },
                 )
                 .child(
+                    Button::new("codex-agent")
+                        .label(if room.show_agent {
+                            "返回房间聊天"
+                        } else {
+                            "Codex 会话"
+                        })
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            let Some(room) = view.active.as_mut() else {
+                                return;
+                            };
+                            if room.agent.is_none() {
+                                let id = room.room_id.clone();
+                                room.agent = Some(cx.new(|cx| AgentView::new(id, cx)));
+                            }
+                            room.show_agent = !room.show_agent;
+                            cx.notify();
+                        })),
+                )
+                .child(
                     Button::new("leave-room")
                         .label("离开房间")
                         .on_click(cx.listener(|view, _, window, cx| {
@@ -401,6 +427,15 @@ impl RoomView {
                             cx.notify();
                         })),
                 );
+        if let Some(agent) = room.agent.as_ref().filter(|_| room.show_agent) {
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .child(header)
+                .child(div().flex_1().min_h_0().child(agent.clone()))
+                .into_any_element();
+        }
         let input = div()
             .flex_none()
             .flex()
