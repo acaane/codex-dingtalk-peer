@@ -169,11 +169,17 @@ jobs:
           }
           release_id=$(find_release)
           if [[ -z "$release_id" ]]; then
-            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-              --title "Python $RELEASE_TAG" --notes "Python connector for Windows. Checksums accompany each archive."
-            release_id=$(find_release)
+            ref="repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG"
+            gh api "$ref" --jq '.ref' >/dev/null
+            release_id=$(gh api --method POST "$releases" \
+              --raw-field "tag_name=$RELEASE_TAG" --raw-field "name=Python $RELEASE_TAG" \
+              --raw-field 'body=Python connector for Windows. Checksums accompany each archive.' \
+              --field draft=true --jq '.id')
           fi
-          [[ "$release_id" =~ ^[0-9]+$ ]]
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "Could not uniquely identify the release for $RELEASE_TAG." >&2
+            exit 1
+          fi
           endpoint="$releases/$release_id"
           release=$(gh api "$endpoint")
           jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and (.prerelease | not)' <<< "$release" >/dev/null
