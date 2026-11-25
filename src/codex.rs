@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env, fs,
     io::{self, BufRead, BufReader, Write},
     os::windows::process::CommandExt,
@@ -8,11 +9,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::readiness::{Failure, Id};
+
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const LIST_TIMEOUT: Duration = Duration::from_secs(12);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
 pub const COORDINATOR_NAME: &str = "AI 联调台协调会话";
 
 #[derive(Clone, Deserialize)]
@@ -117,11 +122,53 @@ fn executable() -> io::Result<PathBuf> {
     ))
 }
 
+pub fn verify_session(project: &Path, thread: &str, challenge: Id) -> Result<Id, Failure> {
+    let mut server = AppServer::connect(project, PROBE_TIMEOUT)
+        .map_err(|error| classify(error, Failure::Session))?;
+    let resumed = server
+        .call(
+            "thread/resume",
+            json!({
+                "threadId": thread, "cwd": project, "excludeTurns": true,
+                "sandbox": "read-only", "approvalPolicy": "never"
+            }),
+        )
+        .map_err(|error| classify(error, Failure::Session))?;
+    if resumed["thread"]["id"].as_str() != Some(thread) {
+        return Err(Failure::Session);
+    }
+    if resumed["thread"]["status"]["type"] == "active" {
+        return Err(Failure::Busy);
+    }
+    let code = format!("PROBE-{}", URL_SAFE_NO_PAD.encode(challenge));
+    let started = server.call(
+        "turn/start",
+        json!({
+            "threadId": thread,
+            "input": [{"type": "text", "text": format!("这是 AI 联调台的只读接单验证。请不要读取文件、运行命令或调用工具。只原样回复以下一行（不要加引号）：{code}"), "text_elements": []}],
+            "approvalPolicy": "never",
+            "sandboxPolicy": {"type": "readOnly", "networkAccess": false}
+        }),
+    ).map_err(|error| classify(error, Failure::Model))?;
+    let turn = started["turn"]["id"].as_str().ok_or(Failure::Model)?;
+    server.verify_turn(thread, turn, &code)?;
+    Ok(challenge)
+}
+
+fn classify(error: io::Error, stage: Failure) -> Failure {
+    if error.kind() == io::ErrorKind::TimedOut {
+        Failure::Timeout
+    } else {
+        stage
+    }
+}
+
 pub struct AppServer {
     process: Child,
     replies: Receiver<Value>,
     seq: u64,
     deadline: Instant,
+    events: VecDeque<Value>,
 }
 
 impl AppServer {
@@ -139,7 +186,11 @@ impl AppServer {
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                 if let Ok(message) = serde_json::from_str::<Value>(&line)
-                    && message.get("id").is_some()
+                    && (message.get("id").is_some()
+                        || matches!(
+                            message["method"].as_str(),
+                            Some("item/completed" | "turn/completed")
+                        ))
                     && sender.send(message).is_err()
                 {
                     break;
@@ -151,6 +202,7 @@ impl AppServer {
             replies,
             seq: 0,
             deadline: Instant::now() + timeout,
+            events: VecDeque::new(),
         };
         server.call(
             "initialize",
@@ -190,28 +242,12 @@ impl AppServer {
         let id = self.seq;
         self.send(json!({"method": method, "id": id, "params": params}))?;
         loop {
-            let left = self.deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "等待 Codex 响应超时",
-                ));
-            }
-            let mut message = self
-                .replies
-                .recv_timeout(left)
-                .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => {
-                        io::Error::new(io::ErrorKind::TimedOut, "等待 Codex 响应超时")
-                    }
-                    mpsc::RecvTimeoutError::Disconnected => {
-                        io::Error::other("Codex 后台进程已退出")
-                    }
-                })?;
-            if message.get("method").is_some() {
-                return Err(io::Error::other("Codex 要求本机确认，请检查当前登录或配置"));
-            }
+            let mut message = self.receive()?;
             if message.get("id").and_then(Value::as_u64) != Some(id) {
+                if method == "turn/start" && message.get("method").is_some() {
+                    // A fast turn can report its items before the RPC acknowledgement arrives.
+                    self.events.push_back(message);
+                }
                 continue;
             }
             if message.get("error").is_some() {
@@ -224,6 +260,68 @@ impl AppServer {
                 .get_mut("result")
                 .map(Value::take)
                 .ok_or_else(|| io::Error::other(format!("本机 Codex 接口 {method} 回执缺少结果")));
+        }
+    }
+
+    fn receive(&self) -> io::Result<Value> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "等待 Codex 响应超时",
+            ));
+        }
+        let message = self
+            .replies
+            .recv_timeout(left)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => {
+                    io::Error::new(io::ErrorKind::TimedOut, "等待 Codex 响应超时")
+                }
+                mpsc::RecvTimeoutError::Disconnected => io::Error::other("Codex 后台进程已退出"),
+            })?;
+        if message.get("id").is_some() && message.get("method").is_some() {
+            return Err(io::Error::other("Codex 要求本机确认，请检查当前登录或配置"));
+        }
+        Ok(message)
+    }
+
+    fn verify_turn(&mut self, thread: &str, turn: &str, expected: &str) -> Result<(), Failure> {
+        let mut matched = false;
+        loop {
+            let message = match self
+                .events
+                .pop_front()
+                .map(Ok)
+                .unwrap_or_else(|| self.receive())
+            {
+                Ok(message) => message,
+                Err(error) => {
+                    let _ = self.send(json!({"id": self.seq + 1, "method": "turn/interrupt", "params": {"threadId": thread, "turnId": turn}}));
+                    return Err(classify(error, Failure::Model));
+                }
+            };
+            let params = &message["params"];
+            if params["threadId"].as_str() != Some(thread) {
+                continue;
+            }
+            match message["method"].as_str() {
+                Some("item/completed") if params["turnId"].as_str() == Some(turn) => {
+                    let item = &params["item"];
+                    if item["type"] == "agentMessage" && item["phase"] != "commentary" {
+                        matched = item["text"]
+                            .as_str()
+                            .is_some_and(|text| text.trim() == expected);
+                    }
+                }
+                Some("turn/completed") if params["turn"]["id"].as_str() == Some(turn) => {
+                    if params["turn"]["status"] != "completed" {
+                        return Err(Failure::Model);
+                    }
+                    return matched.then_some(()).ok_or(Failure::Reply);
+                }
+                _ => {}
+            }
         }
     }
 }

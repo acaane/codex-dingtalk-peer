@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{Connection, SqliteConnection};
 use subtle::ConstantTimeEq;
 
+use crate::readiness;
 use crate::room_sessions::Sessions;
 
 const SERVER_NAME: &str = "codex-room.local";
@@ -131,6 +132,8 @@ enum Request {
         after: i64,
         outgoing: Option<Outgoing>,
         check: Option<MessageId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness: Option<readiness::Request>,
     },
 }
 
@@ -146,6 +149,8 @@ pub struct RoomUpdate {
     pub guest_joined: bool,
     pub messages: Vec<RoomMessage>,
     pub confirmed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<readiness::Update>,
 }
 
 #[derive(Clone)]
@@ -185,11 +190,22 @@ impl RoomClient {
         }
     }
 
+    #[cfg(test)]
     pub fn exchange(
         &self,
         after: i64,
         outgoing: Option<Outgoing>,
         pending: Option<&Outgoing>,
+    ) -> io::Result<RoomUpdate> {
+        self.exchange_with_readiness(after, outgoing, pending, None)
+    }
+
+    pub fn exchange_with_readiness(
+        &self,
+        after: i64,
+        outgoing: Option<Outgoing>,
+        pending: Option<&Outgoing>,
+        readiness: Option<readiness::Request>,
     ) -> io::Result<RoomUpdate> {
         let check = pending.or(outgoing.as_ref()).map(|message| message.id);
         let request = Request::Exchange {
@@ -197,6 +213,7 @@ impl RoomClient {
             after,
             outgoing,
             check,
+            readiness,
         };
         match self.request(request)? {
             Reply::Update(update) => Ok(update),
@@ -369,6 +386,15 @@ impl RoomHost {
                 .fetch_optional(&mut store),
         )
         .map_err(other)?;
+        let readiness = block_on(
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT state FROM room_readiness WHERE slot = 1")
+                .fetch_optional(&mut store),
+        )
+        .map_err(other)?
+        .map(|state| serde_json::from_slice(&state))
+        .transpose()
+        .map_err(other)?
+        .unwrap_or_default();
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let mut room = ServerRoom {
@@ -377,6 +403,7 @@ impl RoomHost {
             invitation: invite.token,
             guest,
             expires_at,
+            readiness,
         };
         let tls = Arc::new(tls);
         std::thread::Builder::new()
@@ -409,6 +436,7 @@ struct ServerRoom {
     invitation: Secret,
     guest: Option<Vec<u8>>,
     expires_at: u64,
+    readiness: readiness::State,
 }
 
 impl ServerRoom {
@@ -471,6 +499,7 @@ impl ServerRoom {
                 after,
                 outgoing,
                 check,
+                readiness,
             } => {
                 let role =
                     if bool::from(self.owner.ct_eq(&member)) {
@@ -489,16 +518,46 @@ impl ServerRoom {
                 {
                     return Reply::Rejected("消息内容或读取位置不合法".into());
                 }
+                let readiness = match readiness
+                    .map(|request| self.update_readiness(role, request))
+                    .transpose()
+                {
+                    Ok(update) => update,
+                    Err(_) => return Reply::Rejected("主机暂时无法保存接单状态".into()),
+                };
                 match block_on(exchange_room(&mut self.store, role, after, outgoing, check)) {
                     Ok((messages, confirmed)) => Reply::Update(RoomUpdate {
                         messages,
                         confirmed,
                         guest_joined: self.guest.is_some(),
+                        readiness,
                     }),
                     Err(_) => Reply::Rejected("主机暂时无法保存或读取房间消息".into()),
                 }
             }
         }
+    }
+
+    fn update_readiness(
+        &mut self,
+        role: Member,
+        request: readiness::Request,
+    ) -> io::Result<readiness::Update> {
+        let mut state = self.readiness.clone();
+        let update = state.apply(role, request, now()?)?;
+        if state != self.readiness {
+            block_on(
+                sqlx::query(
+                    "INSERT INTO room_readiness (slot, state) VALUES (1, ?1)
+                     ON CONFLICT(slot) DO UPDATE SET state = excluded.state",
+                )
+                .bind(serde_json::to_vec(&state).map_err(other)?)
+                .execute(&mut self.store),
+            )
+            .map_err(other)?;
+            self.readiness = state;
+        }
+        Ok(update)
     }
 }
 
@@ -521,6 +580,11 @@ async fn open_room(path: &Path) -> sqlx::Result<SqliteConnection> {
             slot INTEGER PRIMARY KEY CHECK (slot = 1),
             fingerprint BLOB NOT NULL
         )",
+    )
+    .execute(&mut store)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS room_readiness (slot INTEGER PRIMARY KEY, state BLOB NOT NULL)",
     )
     .execute(&mut store)
     .await?;
@@ -696,6 +760,39 @@ mod tests {
             .unwrap();
         let address = Invite::decode(&code).unwrap().address;
         let id = host.room_id.clone();
+        let owner_check = readiness::Request {
+            binding: Some([1; 32]),
+            attempt: [1; 16],
+            retry: false,
+            result: None,
+        };
+        let guest_check = readiness::Request {
+            binding: Some([2; 32]),
+            attempt: [2; 16],
+            ..owner_check
+        };
+        host.client
+            .exchange_with_readiness(0, None, None, Some(owner_check))
+            .unwrap();
+        let challenge = guest
+            .client
+            .exchange_with_readiness(0, None, None, Some(guest_check))
+            .unwrap()
+            .readiness
+            .unwrap()
+            .challenge
+            .unwrap();
+        let passed = readiness::Request {
+            result: Some(readiness::Report {
+                challenge,
+                answer: Ok(challenge),
+            }),
+            ..guest_check
+        };
+        guest
+            .client
+            .exchange_with_readiness(0, None, None, Some(passed))
+            .unwrap();
         drop(guest);
         drop(host);
 
@@ -713,6 +810,18 @@ mod tests {
         assert_eq!(host.host.as_ref().unwrap().1, code);
         assert!(RoomConnection::join(&code, other_data.path()).is_err());
         assert!(!Sessions::has_last(other_data.path()).unwrap());
+        let restarted = readiness::Request {
+            attempt: [3; 16],
+            ..guest_check
+        };
+        let ready = guest
+            .client
+            .exchange_with_readiness(0, None, None, Some(restarted))
+            .unwrap()
+            .readiness
+            .unwrap();
+        assert_eq!(ready.guest, readiness::Status::Passed);
+        assert_eq!(ready.challenge, None);
 
         let history = guest.client.exchange(0, None, None).unwrap();
         assert!(history.guest_joined);

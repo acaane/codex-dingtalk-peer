@@ -4,6 +4,7 @@ mod agent_binding;
 mod agent_view;
 mod chat;
 mod codex;
+mod readiness;
 mod room;
 mod room_sessions;
 mod room_view;
