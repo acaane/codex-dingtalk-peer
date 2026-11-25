@@ -11,11 +11,15 @@ getrandom = "0.3"
 gpui-kit = "=0.10.0"
 if-addrs = "0.15"
 rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+ring = "0.17"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.9.1", default-features = false, features = ["sqlite"] }
 subtle = "2.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -8,13 +8,16 @@ use gpui_kit::component::{
 };
 use gpui_kit::{prelude::FluentBuilder, *};
 
-use crate::room::{self, Member, Outgoing, RoomClient, RoomHost, RoomMessage, RoomUpdate, Secret};
+use crate::{
+    room::{self, Member, Outgoing, RoomClient, RoomConnection, RoomHost, RoomMessage, RoomUpdate},
+    room_sessions::Sessions,
+};
 
 pub struct RoomView {
     addresses: Vec<Ipv4Addr>,
     selected: Option<Ipv4Addr>,
     invite: Entity<TextareaState>,
-    last_join: Option<(String, Secret)>,
+    can_resume: bool,
     composer: Entity<TextareaState>,
     connecting: bool,
     notice: Option<SharedString>,
@@ -42,7 +45,9 @@ impl RoomView {
         Self {
             addresses,
             selected,
-            last_join: None,
+            can_resume: crate::storage::data_directory()
+                .and_then(|directory| Sessions::has_last(&directory))
+                .unwrap_or(false),
             invite: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .rows(3)
@@ -60,40 +65,14 @@ impl RoomView {
         }
     }
 
-    fn connect(&mut self, member: Member, window: &Window, cx: &mut Context<Self>) {
+    fn connect(&mut self, request: ConnectionRequest, window: &Window, cx: &mut Context<Self>) {
         if self.connecting {
             return;
         }
-        let request = match member {
-            Member::Host => {
-                let Some(ip) = self.selected else { return };
-                ConnectionRequest::Host(ip)
-            }
-            Member::Guest => {
-                let value = self.invite.read(cx).value();
-                let code = value.trim().to_owned();
-                if code.is_empty() {
-                    self.notice = Some("请输入完整邀请".into());
-                    cx.notify();
-                    return;
-                }
-                let token = self
-                    .last_join
-                    .as_ref()
-                    .filter(|(previous, _)| previous == &code)
-                    .map(|(_, token)| Ok(*token))
-                    .unwrap_or_else(room::random);
-                let token = match token {
-                    Ok(token) => token,
-                    Err(error) => {
-                        self.notice = Some(error.to_string().into());
-                        cx.notify();
-                        return;
-                    }
-                };
-                self.last_join = Some((code.clone(), token));
-                ConnectionRequest::Join(code, token)
-            }
+        let action = match &request {
+            ConnectionRequest::Host(_) => "创建",
+            ConnectionRequest::Join(_) => "加入",
+            ConnectionRequest::Resume => "继续",
         };
         self.connecting = true;
         self.notice = None;
@@ -105,17 +84,13 @@ impl RoomView {
             let _ = this.update_in(cx, |view, window, cx| {
                 view.connecting = false;
                 match result {
-                    Ok((client, host)) => {
+                    Ok(connection) => {
+                        view.can_resume = true;
                         view.invite
                             .update(cx, |input, cx| input.set_value("", window, cx));
-                        view.enter(member, client, host, window, cx);
+                        view.enter(connection, window, cx);
                     }
                     Err(error) => {
-                        let action = if member == Member::Host {
-                            "创建"
-                        } else {
-                            "加入"
-                        };
                         view.notice = Some(format!("{action}房间失败。{error}").into());
                     }
                 }
@@ -126,21 +101,19 @@ impl RoomView {
         cx.notify();
     }
 
-    fn enter(
-        &mut self,
-        member: Member,
-        client: RoomClient,
-        host: Option<(RoomHost, String)>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn enter(&mut self, connection: RoomConnection, window: &Window, cx: &mut Context<Self>) {
+        let member = if connection.host.is_some() {
+            Member::Host
+        } else {
+            Member::Guest
+        };
         let list = ListState::new(0, ListAlignment::Bottom, px(240.));
         list.set_follow_mode(FollowMode::Tail);
         self.active = Some(ActiveRoom {
-            host,
-            client,
+            host: connection.host,
+            client: connection.client,
             member,
-            connected: true,
+            connected: connection.ready,
             guest_joined: member == Member::Guest,
             messages: Rc::new(Vec::new()),
             list,
@@ -281,6 +254,19 @@ impl RoomView {
             .flex()
             .flex_col()
             .gap_4()
+            .when(self.can_resume, |view| {
+                view.child(
+                    card().child(
+                        Button::new("resume-room")
+                            .label("继续上次房间")
+                            .primary()
+                            .disabled(self.connecting)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.connect(ConnectionRequest::Resume, window, cx)
+                            })),
+                    ),
+                )
+            })
             .child(
                 card()
                     .child(Label::new("选择主协调电脑的内网地址").text_sm())
@@ -315,7 +301,9 @@ impl RoomView {
                             .primary()
                             .disabled(self.selected.is_none() || self.connecting)
                             .on_click(cx.listener(|view, _, window, cx| {
-                                view.connect(Member::Host, window, cx)
+                                if let Some(ip) = view.selected {
+                                    view.connect(ConnectionRequest::Host(ip), window, cx);
+                                }
                             })),
                     ),
             )
@@ -331,7 +319,8 @@ impl RoomView {
                             .label("加入房间")
                             .disabled(self.connecting)
                             .on_click(cx.listener(|view, _, window, cx| {
-                                view.connect(Member::Guest, window, cx)
+                                let code = view.invite.read(cx).value().trim().to_owned();
+                                view.connect(ConnectionRequest::Join(code), window, cx);
                             })),
                     ),
             )
@@ -458,18 +447,17 @@ impl RoomView {
 
 enum ConnectionRequest {
     Host(Ipv4Addr),
-    Join(String, Secret),
+    Join(String),
+    Resume,
 }
 
 impl ConnectionRequest {
-    fn open(self) -> std::io::Result<(RoomClient, Option<(RoomHost, String)>)> {
+    fn open(self) -> std::io::Result<RoomConnection> {
+        let directory = crate::storage::data_directory()?;
         match self {
-            Self::Host(ip) => {
-                let path = crate::storage::data_directory()?.join("rooms");
-                let (host, client, invite) = RoomHost::start(ip, &path)?;
-                Ok((client, Some((host, invite))))
-            }
-            Self::Join(code, token) => Ok((RoomClient::join(&code, token)?, None)),
+            Self::Host(ip) => RoomConnection::create(ip, &directory),
+            Self::Join(code) => RoomConnection::join(&code, &directory),
+            Self::Resume => RoomConnection::resume(&directory),
         }
     }
 }

@@ -6,11 +6,12 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_lite::future::block_on;
+use ring::digest::{SHA256, digest};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
     pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName},
@@ -18,6 +19,8 @@ use rustls::{
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{Connection, SqliteConnection};
 use subtle::ConstantTimeEq;
+
+use crate::room_sessions::Sessions;
 
 const SERVER_NAME: &str = "codex-room.local";
 const INVITE_PREFIX: &str = "cdp-room-1.";
@@ -80,7 +83,7 @@ impl Outgoing {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Invite {
     address: SocketAddrV4,
     certificate: Vec<u8>,
@@ -88,6 +91,10 @@ struct Invite {
 }
 
 impl Invite {
+    fn room_id(&self) -> String {
+        URL_SAFE_NO_PAD.encode(digest(&SHA256, &self.certificate))
+    }
+
     fn encode(&self) -> io::Result<String> {
         let bytes = serde_json::to_vec(self).map_err(other)?;
         Ok(format!("{INVITE_PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes)))
@@ -95,6 +102,9 @@ impl Invite {
 
     fn decode(code: &str) -> io::Result<Self> {
         let code = code.trim();
+        if code.is_empty() {
+            return Err(problem("请输入完整邀请"));
+        }
         let encoded = code
             .strip_prefix(INVITE_PREFIX)
             .filter(|code| code.len() <= 8192)
@@ -164,9 +174,8 @@ impl RoomClient {
         })
     }
 
-    pub fn join(code: &str, member: Secret) -> io::Result<Self> {
-        let invite = Invite::decode(code)?;
-        let client = Self::new(&invite, member)?;
+    fn join(invite: &Invite, member: Secret) -> io::Result<Self> {
+        let client = Self::new(invite, member)?;
         match client.request(Request::Join {
             invitation: invite.token,
             member,
@@ -219,47 +228,155 @@ impl Drop for RoomHost {
     }
 }
 
-impl RoomHost {
-    pub fn start(ip: Ipv4Addr, directory: &Path) -> io::Result<(Self, RoomClient, String)> {
+#[derive(Serialize, Deserialize)]
+enum SavedRoom {
+    Host {
+        invite: Invite,
+        key: Vec<u8>,
+        owner: Secret,
+        expires_at: u64,
+    },
+    Guest {
+        invite: Invite,
+        member: Secret,
+    },
+}
+
+pub struct RoomConnection {
+    pub client: RoomClient,
+    pub host: Option<(RoomHost, String)>,
+    pub room_id: String,
+    pub ready: bool,
+}
+
+impl RoomConnection {
+    pub fn create(ip: Ipv4Addr, directory: &Path) -> io::Result<Self> {
         if !allowed_address(ip) {
             return Err(problem("请选择本机的内网 IPv4 地址"));
         }
         let listener = TcpListener::bind((ip, 0))?;
-        listener.set_nonblocking(true)?;
-        let port = listener.local_addr()?.port();
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec![SERVER_NAME.to_string()]).map_err(other)?;
-        let certificate = cert.der().clone();
+        let invite = Invite {
+            address: SocketAddrV4::new(ip, listener.local_addr()?.port()),
+            certificate: cert.der().as_ref().to_vec(),
+            token: random()?,
+        };
+        let owner = random()?;
+        let key = signing_key.serialize_der();
+        let expires_at = now()? + INVITE_LIFETIME.as_secs();
+        let mut sessions = Sessions::open(directory)?;
+        sessions.remember(
+            &invite.room_id(),
+            &SavedRoom::Host {
+                invite: invite.clone(),
+                key: key.clone(),
+                owner,
+                expires_at,
+            },
+        )?;
+        let connection = RoomHost::listen(listener, directory, invite, key, owner, expires_at)?;
+        sessions.mark_opened(&connection.room_id)?;
+        Ok(connection)
+    }
+
+    pub fn join(code: &str, directory: &Path) -> io::Result<Self> {
+        let invite = Invite::decode(code)?;
+        let room_id = invite.room_id();
+        let mut sessions = Sessions::open(directory)?;
+        if sessions.get::<SavedRoom>(&room_id)?.is_none() {
+            // Record the credential before sending it so a lost reply is safe to retry.
+            sessions.remember(
+                &room_id,
+                &SavedRoom::Guest {
+                    invite: invite.clone(),
+                    member: random()?,
+                },
+            )?;
+        }
+        let member = match sessions.get::<SavedRoom>(&room_id)? {
+            Some(SavedRoom::Guest { member, .. }) => member,
+            _ => return Err(problem("这台电脑已经以主协调端身份保存了该房间")),
+        };
+        let client = RoomClient::join(&invite, member)?;
+        sessions.mark_opened(&room_id)?;
+        Ok(Self {
+            client,
+            host: None,
+            room_id,
+            ready: true,
+        })
+    }
+
+    pub fn resume(directory: &Path) -> io::Result<Self> {
+        match Sessions::open(directory)?
+            .last()?
+            .ok_or_else(|| problem("本机还没有可继续的房间"))?
+        {
+            SavedRoom::Host {
+                invite,
+                key,
+                owner,
+                expires_at,
+            } => {
+                let listener = TcpListener::bind(invite.address).map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("无法监听原来的内网地址和端口，请检查网卡地址与端口占用。{error}"),
+                    )
+                })?;
+                RoomHost::listen(listener, directory, invite, key, owner, expires_at)
+            }
+            SavedRoom::Guest { invite, member } => Ok(Self {
+                client: RoomClient::new(&invite, member)?,
+                host: None,
+                room_id: invite.room_id(),
+                ready: false,
+            }),
+        }
+    }
+}
+
+impl RoomHost {
+    fn listen(
+        listener: TcpListener,
+        directory: &Path,
+        invite: Invite,
+        key: Vec<u8>,
+        owner: Secret,
+        expires_at: u64,
+    ) -> io::Result<RoomConnection> {
+        listener.set_nonblocking(true)?;
         let tls =
             ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
                 .with_safe_default_protocol_versions()
                 .map_err(other)?
                 .with_no_client_auth()
                 .with_single_cert(
-                    vec![certificate.clone()],
-                    PrivatePkcs8KeyDer::from(signing_key.serialize_der()).into(),
+                    vec![CertificateDer::from(invite.certificate.clone())],
+                    PrivatePkcs8KeyDer::from(key).into(),
                 )
                 .map_err(other)?;
-        let invite = Invite {
-            address: SocketAddrV4::new(ip, port),
-            certificate: certificate.as_ref().to_vec(),
-            token: random()?,
-        };
-        let owner = random()?;
         let client = RoomClient::new(&invite, owner)?;
         let code = invite.encode()?;
-        std::fs::create_dir_all(directory)?;
-        let room_id = URL_SAFE_NO_PAD.encode(random::<16>()?);
-        let path = directory.join(format!("{room_id}.sqlite3"));
-        let store = block_on(open_room(&path)).map_err(other)?;
+        let room_id = invite.room_id();
+        let rooms = directory.join("rooms");
+        std::fs::create_dir_all(&rooms)?;
+        let mut store =
+            block_on(open_room(&rooms.join(format!("{room_id}.sqlite3")))).map_err(other)?;
+        let guest = block_on(
+            sqlx::query_scalar::<_, Vec<u8>>("SELECT fingerprint FROM room_guest WHERE slot = 1")
+                .fetch_optional(&mut store),
+        )
+        .map_err(other)?;
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let mut room = ServerRoom {
             store,
             owner,
             invitation: invite.token,
-            guest: None,
-            started: Instant::now(),
+            guest,
+            expires_at,
         };
         let tls = Arc::new(tls);
         std::thread::Builder::new()
@@ -277,7 +394,12 @@ impl RoomHost {
                     }
                 }
             })?;
-        Ok((Self { stop }, client, code))
+        Ok(RoomConnection {
+            client,
+            host: Some((Self { stop }, code)),
+            room_id,
+            ready: true,
+        })
     }
 }
 
@@ -285,8 +407,8 @@ struct ServerRoom {
     store: SqliteConnection,
     owner: Secret,
     invitation: Secret,
-    guest: Option<Secret>,
-    started: Instant,
+    guest: Option<Vec<u8>>,
+    expires_at: u64,
 }
 
 impl ServerRoom {
@@ -318,17 +440,30 @@ impl ServerRoom {
                 if !bool::from(self.invitation.ct_eq(&invitation)) {
                     return Reply::Rejected("邀请无效".into());
                 }
-                if let Some(guest) = self.guest {
-                    return if bool::from(guest.ct_eq(&member)) {
+                let fingerprint = digest(&SHA256, &member);
+                if let Some(guest) = &self.guest {
+                    return if bool::from(guest.ct_eq(fingerprint.as_ref())) {
                         Reply::Joined
                     } else {
                         Reply::Rejected("该邀请已被使用".into())
                     };
                 }
-                if self.started.elapsed() >= INVITE_LIFETIME {
+                let Ok(current) = now() else {
+                    return Reply::Rejected("主机系统时间异常".into());
+                };
+                if current >= self.expires_at {
                     return Reply::Rejected("邀请已过期，请由主协调端重新创建房间".into());
                 }
-                self.guest = Some(member);
+                if block_on(
+                    sqlx::query("INSERT INTO room_guest (slot, fingerprint) VALUES (1, ?1)")
+                        .bind(fingerprint.as_ref())
+                        .execute(&mut self.store),
+                )
+                .is_err()
+                {
+                    return Reply::Rejected("主机暂时无法保存接入身份".into());
+                }
+                self.guest = Some(fingerprint.as_ref().to_vec());
                 Reply::Joined
             }
             Request::Exchange {
@@ -337,16 +472,16 @@ impl ServerRoom {
                 outgoing,
                 check,
             } => {
-                let role = if bool::from(self.owner.ct_eq(&member)) {
-                    Member::Host
-                } else if self
-                    .guest
-                    .is_some_and(|guest| bool::from(guest.ct_eq(&member)))
-                {
-                    Member::Guest
-                } else {
-                    return Reply::Rejected("尚未加入该房间".into());
-                };
+                let role =
+                    if bool::from(self.owner.ct_eq(&member)) {
+                        Member::Host
+                    } else if self.guest.as_ref().is_some_and(|guest| {
+                        bool::from(guest.ct_eq(digest(&SHA256, &member).as_ref()))
+                    }) {
+                        Member::Guest
+                    } else {
+                        return Reply::Rejected("尚未加入该房间".into());
+                    };
                 if after < 0
                     || outgoing.as_ref().is_some_and(|msg| {
                         msg.body.trim().is_empty() || msg.body.len() > MAX_MESSAGE_BYTES
@@ -377,6 +512,14 @@ async fn open_room(path: &Path) -> sqlx::Result<SqliteConnection> {
             body TEXT NOT NULL,
             sent_at INTEGER NOT NULL DEFAULT (unixepoch()),
             UNIQUE(author, request_id)
+        )",
+    )
+    .execute(&mut store)
+    .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS room_guest (
+            slot INTEGER PRIMARY KEY CHECK (slot = 1),
+            fingerprint BLOB NOT NULL
         )",
     )
     .execute(&mut store)
@@ -462,6 +605,13 @@ fn allowed_address(ip: Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback() || ip.is_link_local()
 }
 
+fn now() -> io::Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(other)
+}
+
 fn problem(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
@@ -529,13 +679,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restores_both_members_and_chat_after_host_shutdown() {
+        let owner_data = tempfile::tempdir().unwrap();
+        let guest_data = tempfile::tempdir().unwrap();
+        let other_data = tempfile::tempdir().unwrap();
+        let host = RoomConnection::create(Ipv4Addr::LOCALHOST, owner_data.path()).unwrap();
+        let code = host.host.as_ref().unwrap().1.clone();
+        let guest = RoomConnection::join(&code, guest_data.path()).unwrap();
+        guest
+            .client
+            .exchange(
+                0,
+                Some(Outgoing::new("之前发的中文消息".into()).unwrap()),
+                None,
+            )
+            .unwrap();
+        let address = Invite::decode(&code).unwrap().address;
+        let id = host.room_id.clone();
+        drop(guest);
+        drop(host);
+
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        while TcpStream::connect_timeout(&address.into(), Duration::from_millis(50)).is_ok() {
+            assert!(Instant::now() < deadline, "主机应在关闭后释放监听");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(Sessions::has_last(guest_data.path()).unwrap());
+        let guest = RoomConnection::resume(guest_data.path()).unwrap();
+        assert!(!guest.ready);
+        let host = RoomConnection::resume(owner_data.path()).unwrap();
+        assert_eq!(host.room_id, id);
+        assert_eq!(guest.room_id, id);
+        assert_eq!(host.host.as_ref().unwrap().1, code);
+        assert!(RoomConnection::join(&code, other_data.path()).is_err());
+        assert!(!Sessions::has_last(other_data.path()).unwrap());
+
+        let history = guest.client.exchange(0, None, None).unwrap();
+        assert!(history.guest_joined);
+        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages[0].body, "之前发的中文消息");
+        let after = history.messages[0].id;
+        host.client
+            .exchange(
+                after,
+                Some(Outgoing::new("重启后的回复".into()).unwrap()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            guest.client.exchange(after, None, None).unwrap().messages[0].body,
+            "重启后的回复"
+        );
+    }
+
+    #[test]
     fn two_members_exchange_and_store_exactly_once() {
         let directory = tempfile::tempdir().unwrap();
-        let (_host, owner, code) = RoomHost::start(Ipv4Addr::LOCALHOST, directory.path()).unwrap();
+        let host = RoomConnection::create(Ipv4Addr::LOCALHOST, directory.path()).unwrap();
+        let owner = &host.client;
+        let code = &host.host.as_ref().unwrap().1;
+        let invite = Invite::decode(code).unwrap();
         let guest_identity = random().unwrap();
-        let guest = RoomClient::join(&code, guest_identity).unwrap();
-        assert!(RoomClient::join(&code, random().unwrap()).is_err());
-        assert!(RoomClient::join(&code, guest_identity).is_ok());
+        let guest = RoomClient::join(&invite, guest_identity).unwrap();
+        assert!(RoomClient::join(&invite, random().unwrap()).is_err());
+        assert!(RoomClient::join(&invite, guest_identity).is_ok());
 
         let first = Outgoing::new("主协调端\n中文测试".into()).unwrap();
         assert!(
@@ -563,12 +770,10 @@ mod tests {
         assert_eq!(incoming.messages[0].author, Member::Guest);
         assert_eq!(incoming.messages[0].body, "接入端回报");
 
-        let stored = std::fs::read_dir(directory.path())
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
+        let stored = directory
+            .path()
+            .join("rooms")
+            .join(format!("{}.sqlite3", host.room_id));
         block_on(async {
             let mut store = open_room(&stored).await.unwrap();
             let count: i64 = sqlx::query_scalar("SELECT count(*) FROM room_messages")
@@ -582,16 +787,18 @@ mod tests {
     #[test]
     fn rejects_wrong_certificate_invite_and_member() {
         let directory = tempfile::tempdir().unwrap();
-        let a = directory.path().join("a");
-        let b = directory.path().join("b");
-        let (_host, _, code) = RoomHost::start(Ipv4Addr::LOCALHOST, &a).unwrap();
-        let (_other, _, other_code) = RoomHost::start(Ipv4Addr::LOCALHOST, &b).unwrap();
-        let mut invite = Invite::decode(&code).unwrap();
+        let a = tempfile::tempdir_in(directory.path()).unwrap();
+        let b = tempfile::tempdir_in(directory.path()).unwrap();
+        let host = RoomConnection::create(Ipv4Addr::LOCALHOST, a.path()).unwrap();
+        let other = RoomConnection::create(Ipv4Addr::LOCALHOST, b.path()).unwrap();
+        let mut invite = Invite::decode(&host.host.as_ref().unwrap().1).unwrap();
         let wrong = RoomClient::new(&invite, random().unwrap()).unwrap();
         assert!(wrong.exchange(0, None, None).is_err());
         invite.token = random().unwrap();
-        assert!(RoomClient::join(&invite.encode().unwrap(), random().unwrap()).is_err());
-        invite.certificate = Invite::decode(&other_code).unwrap().certificate;
-        assert!(RoomClient::join(&invite.encode().unwrap(), random().unwrap()).is_err());
+        assert!(RoomClient::join(&invite, random().unwrap()).is_err());
+        invite.certificate = Invite::decode(&other.host.as_ref().unwrap().1)
+            .unwrap()
+            .certificate;
+        assert!(RoomClient::join(&invite, random().unwrap()).is_err());
     }
 }
