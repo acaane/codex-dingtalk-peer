@@ -29,6 +29,8 @@
 
 使用 sub2api 等自定义模型提供方时，在本机 Codex 用户级 `config.toml` 选中该提供方，并由本人配置网关凭据。当前提供方不需要 OpenAI 登录时，连接器沿用本机模型配置，通过一次实际调用确认可用。已有部署切换模型提供方后，正常停止连接器并运行 `scripts/diagnostics/check.cmd`，通过后再运行 `start.cmd`。[本机配置示例](docs/participant-onboarding.txt)
 
+日常直接运行 `start.cmd`。连接器复用已绑定会话所在的 Codex 目录或本机已保存的选择，并沿用 Codex 的凭据来源。对于需要 `env_key` 的提供方，首次可复用当前终端已有的 Token。没有可用凭据时由本人隐藏输入一次，连接器用 Windows DPAPI 加密保存在本机 `.local`，以后自动加载到启动进程。已有登录和项目绑定可继续使用。[首次配置和更换凭据](docs/participant-onboarding.txt)
+
 接入校验会短暂等待群历史同步，仅回读原消息。平台明确拒绝时，修正后运行 `scripts/setup/setup.cmd` 可重试一次；回执不明时仍不重发。`scripts/diagnostics/collect-group-info.cmd` 可在接入未完成时生成 `group-diagnostics.json`，包含实际 DWS 版本、公开发送能力、群身份和原校验状态，不发送消息、不更改授权或输出凭据。
 
 需要更换本人 Webhook 时运行 `scripts/setup/setup.cmd`，在已保存 Webhook 的提示中选 `2=重新粘贴`，只在本机隐藏输入当前完整链接。回车默认复用已保存值，旁边的旧 Excel 不覆盖这个选择。平台返回 `300005 / token is not exist` 时检查当前机器人链接；原接入记录会在凭据更换后保留副本，不必删除 `.local` 或重装登录。

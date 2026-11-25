@@ -12,8 +12,10 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import warnings
 from urllib.parse import parse_qs, urlparse, urlencode
 
 from peer import (ROOT, PeerError, Transport, bind_store_context, codex_command, configured_project,
@@ -839,8 +841,8 @@ def start_connector(path, peer_id):
     if result is not None:
         return result
     # Refresh identity only when starting an instance, not when viewing a running one.
-    check_config(path)
-    config = load_config(path)
+    config = check_config(path)
+    prepare_local_codex(config, peer_id)
     try:
         coordinator = ensure_business_agent(config, peer_id)
         if coordinator['state'] in ('created', 'reused'):
@@ -916,6 +918,162 @@ def ensure_dws_login(tools, finish_initial_login=False):
     profile = choose_profile(run_json([tools["dws_path"], "profile", "list", "--format", "json"]))
     say(f"钉钉身份：{profile.get('corpName', '')} / {profile.get('userName', '')}")
     return profile
+
+
+def _contains_thread(home, thread):
+    for database in home.glob('state_*.sqlite'):
+        try:
+            connection = sqlite3.connect(database.as_uri() + '?mode=ro', uri=True, timeout=1)
+            try:
+                if connection.execute('SELECT 1 FROM threads WHERE id=?', (thread,)).fetchone():
+                    return True
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            continue
+    return False
+
+
+def _select_home(saved, thread, setup):
+    explicit = os.environ.get('CODEX_HOME')
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    default = (Path.home() / '.codex').resolve()
+    cli_home = (Path.home() / '.codex-cli').resolve()
+    candidates = tuple(dict.fromkeys(home for home in (saved, default, cli_home)
+                                    if home is not None and home.is_dir()))
+    if thread:
+        matches = [home for home in candidates if _contains_thread(home, thread)]
+        if len(matches) == 1:
+            return matches[0]
+    if saved in candidates:
+        return saved
+    has_cli_config = (cli_home / 'config.toml').is_file()
+    has_default_config = (default / 'config.toml').is_file()
+    if has_cli_config and not has_default_config:
+        return cli_home
+    if has_cli_config and has_default_config and setup and sys.stdin.isatty():
+        choice = input('Codex 目录：回车选择 .codex，输入 2 选择 .codex-cli：').strip()
+        if choice == '2':
+            return cli_home
+        if choice not in ('', '1'):
+            raise PeerError('Codex 目录选项无效，请重新运行设置。')
+    return default
+
+
+def _provider(root, codex):
+    from business_consumer import RpcError, StdioClient, cli_command
+
+    client = None
+    try:
+        client = StdioClient(cli_command({'codex_path': codex}), str(root))
+        client.call('initialize', {'clientInfo': {'name': 'dingtalk_peer_setup', 'version': '1'}}, timeout=8)
+        client.send({'method': 'initialized', 'params': {}})
+        result = client.call('config/read', {'includeLayers': False}, timeout=8)
+        config = result.get('config', {})
+        provider = config.get('model_provider')
+        return provider, (config.get('model_providers') or {}).get(provider, {})
+    except (OSError, TimeoutError, RpcError, PeerError):
+        return None, {}
+    finally:
+        if client is not None:
+            client.close()
+
+
+def _has_dotenv_key(home, key):
+    # Codex reads its own .env. Inspect the named assignment only, leaving the
+    # credential in its existing source and letting Codex handle its syntax.
+    dotenv = home / '.env'
+    if not dotenv.is_file():
+        return False
+    with dotenv.open(encoding='utf-8-sig', errors='replace') as source:
+        for line in source:
+            name, separator, value = line.strip().partition('=')
+            if separator and name.removeprefix('export ').strip() == key:
+                value = value.strip()
+                if value and not value.startswith('#') and value not in ('""', "''"):
+                    return True
+    return False
+
+
+def _save_token(path, token):
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + '.', delete=False) as staged:
+        temporary = Path(staged.name)
+    try:
+        protect(token, temporary)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _hidden_token():
+    if not sys.stdin.isatty():
+        raise PeerError('本机缺少模型网关凭据。请在连接器目录的 Windows 终端运行 start.cmd，首次隐藏输入。')
+    with warnings.catch_warnings():
+        warnings.simplefilter('error', getpass.GetPassWarning)
+        try:
+            token = getpass.getpass('首次配置：粘贴本人模型网关 Token（输入隐藏），然后回车：').strip()
+        except (EOFError, getpass.GetPassWarning):
+            raise PeerError('无法隐藏读取模型网关凭据。请在 Windows 终端运行 start.cmd。') from None
+    if not token:
+        raise PeerError('模型网关 Token 为空，请重新运行 start.cmd。')
+    return token
+
+
+def prepare_codex_startup(root, codex, thread=None, setup=False):
+    """Load credentials into this launcher's process so its Codex children inherit them."""
+    selection = safe_path(root, '.local/codex-home.json')
+    saved = None
+    if selection.is_file():
+        value = json.loads(selection.read_text(encoding='utf-8-sig')).get('home')
+        if isinstance(value, str) and value:
+            saved = Path(value).resolve()
+    home = _select_home(saved, thread, setup)
+    if not home.is_dir():
+        return
+    os.environ['CODEX_HOME'] = str(home)
+    if saved != home and (setup or saved is not None or home != (Path.home() / '.codex').resolve()):
+        selection.parent.mkdir(parents=True, exist_ok=True)
+        save_json(selection, {'home': str(home)})
+
+    if not (home / 'config.toml').is_file():
+        return
+    provider, settings = _provider(root, codex)
+    key = settings.get('env_key')
+    if not isinstance(key, str) or not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', key):
+        return
+    token = os.environ.get(key, '').strip()
+    if not token and _has_dotenv_key(home, key):
+        return
+
+    scope = [os.path.normcase(str(home)), provider, settings.get('base_url'), key]
+    identity = hashlib.sha256(json.dumps(scope, ensure_ascii=False).encode('utf-8')).hexdigest()
+    path = safe_path(root, f'.local/codex-provider-{identity}.protected')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with acquire_instance_lock(path.with_suffix('.lock')):
+        try:
+            previous = unprotect(path).strip() if path.is_file() else ''
+        except (OSError, ValueError):
+            previous = ''
+        if not token and previous and setup and sys.stdin.isatty():
+            choice = input('模型网关凭据：回车复用，输入 2 重新粘贴：').strip()
+            if choice == '2':
+                token = _hidden_token()
+            elif choice not in ('', '1'):
+                raise PeerError('模型网关凭据选项无效，请重新运行设置。')
+        token = token or previous or _hidden_token()
+        if token != previous:
+            _save_token(path, token)
+        os.environ[key] = token
+
+
+def prepare_local_codex(config, peer_id, setup=False):
+    binding = safe_path(project_local(ROOT, config), f'business-agent-{peer_id}.json')
+    thread = None
+    if binding.is_file():
+        data = json.loads(binding.read_text(encoding='utf-8-sig'))
+        thread = data.get('thread')
+    prepare_codex_startup(ROOT, config['codex_path'], thread=thread, setup=setup)
 
 
 def codex_requires_openai_auth(codex):
@@ -1214,6 +1372,7 @@ def main():
             raise PeerError('登录身份或本人端ID在检测后发生了变化，请重新运行setup检测。')
         if not discovery and profile.get("userName") != expected:
             raise PeerError(f"当前钉钉登录为 {profile.get('userName', '')}，所选机器人属于 {expected}。请用本人身份登录或重新选择机器人。")
+        prepare_local_codex({'project_id': args.project_id, 'codex_path': tools['codex_path']}, args.peer, setup=True)
         provider_auth = ensure_codex_auth(tools['codex_path'])
         model = None
         if not provider_auth:
@@ -1251,6 +1410,7 @@ def main():
     machine = json.loads((ROOT / ".local/machine.json").read_text(encoding="utf-8"))
     if args.command == "check":
         ensure_dws_login(tools)
+        prepare_local_codex(config, machine['peer'])
         provider_auth = ensure_codex_auth(tools['codex_path'])
         config = check_config(path)
         check_codex(config, provider_auth=provider_auth)

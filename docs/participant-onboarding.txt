@@ -27,3 +27,5 @@
     experimental_bearer_token = "REPLACE_WITH_YOUR_ASSIGNED_TOKEN"
 
 把地址占位符替换为本单位分配的网关地址。由本人在本机填自己的网关令牌；已有 env_key 等可用凭据配置可继续使用。连接器复用 Codex 的配置，API 凭据留在 Codex 的本机配置或凭据来源中。首次继续运行 start.cmd；已完成接入、改用网关时先正常停止连接器，执行 scripts/diagnostics/check.cmd，检查通过后再运行 start.cmd。钉钉授权和 Webhook 仍按原步骤办理。
+
+配置好后日常直接运行 start.cmd。首次启动会在可确定时复用原会话所在的 .codex 或 .codex-cli 目录，或记住当前 CODEX_HOME 选定的目录。Codex 自带的有效认证命令和 .env 可继续使用。若当前终端已有 env_key 指定的 Token，连接器会自动保存一份 Windows DPAPI 加密副本。新电脑没有可用 Token 时，按提示隐藏输入一次。以后 start.cmd 自动加载已保存的目录和凭据。换 Token 时可通过 scripts/setup/setup.cmd 选择重新粘贴，凭据文件由原 Windows 用户在本机使用。

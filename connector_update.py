@@ -22,10 +22,11 @@ from reliability import DeliveryUnknown, PeerError, SendRejected, retry_delay
 PREFIX = "【AI联调更新】"
 MAX_BYTES = 96 * 1024
 CHUNK_CHARS = 3000
+LEGACY_OPERATOR_SCRIPTS = frozenset(("setup.cmd", "task.cmd", "stop-task.cmd", "check.cmd",
+                                     "resume.cmd", "enable-auto-update.cmd", "publish-update.cmd"))
 ALLOWED = frozenset(("peer.py", "reliability.py", "connector_update.py", "supervisor.py",
                      "setup_helper.py", "business_consumer.py", "windows_secret.py", "response.schema.json",
-                     "install.ps1", "bootstrap.ps1", "start.cmd", "setup.cmd", "task.cmd",
-                     "stop-task.cmd", "check.cmd", "resume.cmd", "enable-auto-update.cmd", "publish-update.cmd"))
+                     "install.ps1", "bootstrap.ps1", "start.cmd")) | LEGACY_OPERATOR_SCRIPTS
 
 
 def update_message(event, **fields):
@@ -250,16 +251,23 @@ class PublicationLock:
 
 
 def publication_candidate(root):
+    root = Path(root).resolve()
     files = {}
     for name in sorted(ALLOWED):
         path = safe_path(root, name)
         if not path.is_file():
+            if name in LEGACY_OPERATOR_SCRIPTS:
+                continue
             raise PeerError("Automatic publication requires all connector runtime files")
         files[name] = path.read_bytes()
     runtime_digest = files_digest(files)
-    tests = sorted(Path(root).glob("test_*.py"))
+    tests = sorted([*root.glob("test_*.py"), *root.glob("tests/test_*.py")])
     for path in tests:
-        files[path.name] = safe_path(root, path.name).read_bytes()
+        name = path.relative_to(root).as_posix()
+        files[name] = safe_path(root, name).read_bytes()
+    test_package = safe_path(root, "tests/__init__.py")
+    if test_package.is_file():
+        files["tests/__init__.py"] = test_package.read_bytes()
     return {"candidate": files_digest(files), "content_sha256": runtime_digest, "test_files": len(tests)}
 
 
@@ -452,9 +460,12 @@ class AutoPublisher:
             return
         try:
             candidate = publication_candidate(self.root)
-            release = published_release(self.root, json.loads(Path(self.config_path).read_text(encoding="utf-8-sig")), self.peer_id)
-            if release and release[0]["target"] == "ALL" and release[0]["content_sha256"] == candidate["content_sha256"]:
-                return
+            config = json.loads(Path(self.config_path).read_text(encoding="utf-8-sig"))
+            release = published_release(self.root, config, self.peer_id)
+            if release and release[0]["content_sha256"] == candidate["content_sha256"]:
+                other_peers = {peer["id"] for peer in config["peers"]} - {self.peer_id}
+                if release[0]["target"] == "ALL" or other_peers == {release[0]["target"]}:
+                    return
             state = self._state()
             if state.get("content_sha256") == candidate["content_sha256"] and state.get("status") in ("publishing", "delivery_unknown", "publication_failed"):
                 return

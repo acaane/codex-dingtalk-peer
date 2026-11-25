@@ -2,6 +2,7 @@ import json
 import copy
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import types
 import unittest
@@ -9,8 +10,80 @@ from unittest.mock import patch
 
 import peer
 from setup_helper import (check_codex, choose_profile, dws_login_command, ensure_codex_auth,
-                          resolve_group_identities, run_supervisor)
+                          prepare_codex_startup, resolve_group_identities, run_supervisor)
 from windows_secret import protect, unprotect
+
+
+class CodexStartupTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(prefix='AI peer Codex startup ')
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name) / 'connector'
+        self.root.mkdir()
+        self.user = Path(directory.name) / 'user'
+        self.default = self.user / '.codex'
+        self.custom = self.user / '.codex-cli'
+        for home in (self.default, self.custom):
+            home.mkdir(parents=True)
+            (home / 'config.toml').write_text('', encoding='utf-8')
+        self.key = 'PEER_TEST_PROVIDER_KEY'
+        self.thread = '00000000-0000-0000-0000-000000000001'
+        with sqlite3.connect(self.custom / 'state_5.sqlite') as connection:
+            connection.execute('CREATE TABLE threads (id TEXT PRIMARY KEY)')
+            connection.execute('INSERT INTO threads VALUES (?)', (self.thread,))
+        connection.close()
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop('CODEX_HOME', None)
+        os.environ.pop(self.key, None)
+        home = patch.object(Path, 'home', return_value=self.user)
+        home.start()
+        self.addCleanup(home.stop)
+        provider = patch('setup_helper._provider', return_value=(
+            'test-provider', {'env_key': self.key, 'base_url': 'https://example.invalid/v1'}))
+        self.provider = provider.start()
+        self.addCleanup(provider.stop)
+
+    @unittest.skipUnless(os.name == 'nt', 'DPAPI requires Windows')
+    def test_existing_environment_is_saved_and_reused_after_reopening_terminal(self):
+        token = 'synthetic-test-provider-secret'
+        os.environ[self.key] = token
+        with patch('setup_helper._hidden_token') as prompt:
+            prepare_codex_startup(self.root, 'codex.exe', thread=self.thread)
+            self.assertEqual(Path(os.environ['CODEX_HOME']), self.custom)
+            encrypted, = (self.root / '.local').glob('codex-provider-*.protected')
+            self.assertNotIn(token.encode(), encrypted.read_bytes())
+            os.environ.pop(self.key)
+            os.environ.pop('CODEX_HOME')
+            prepare_codex_startup(self.root, 'codex.exe')
+            self.assertEqual(Path(os.environ['CODEX_HOME']), self.custom)
+            self.assertEqual(os.environ[self.key], token)
+            prompt.assert_not_called()
+
+    @unittest.skipUnless(os.name == 'nt', 'DPAPI requires Windows')
+    def test_first_input_only_occurs_once_and_old_gateway_token_is_scoped(self):
+        with patch('setup_helper._hidden_token', side_effect=['first-fixture', 'new-gateway-fixture']) as prompt:
+            prepare_codex_startup(self.root, 'codex.exe', thread=self.thread)
+            os.environ.pop(self.key)
+            prepare_codex_startup(self.root, 'codex.exe')
+            self.assertEqual(os.environ.pop(self.key), 'first-fixture')
+            self.assertEqual(prompt.call_count, 1)
+            self.provider.return_value[1]['base_url'] = 'https://other.example.invalid/v1'
+            prepare_codex_startup(self.root, 'codex.exe')
+            self.assertEqual(os.environ[self.key], 'new-gateway-fixture')
+            self.assertEqual(prompt.call_count, 2)
+
+    def test_native_credentials_can_be_reused_without_provider_storage(self):
+        (self.custom / '.env').write_text(f'{self.key}=native-fixture\n', encoding='utf-8')
+        with patch('setup_helper._hidden_token') as prompt:
+            prepare_codex_startup(self.root, 'codex.exe', thread=self.thread)
+            self.assertEqual(Path(os.environ['CODEX_HOME']), self.custom)
+            self.assertNotIn(self.key, os.environ)
+            self.provider.return_value = ('test-provider', {'auth': {'command': 'existing-helper'}})
+            prepare_codex_startup(self.root, 'codex.exe')
+            self.assertFalse(list((self.root / '.local').glob('codex-provider-*.protected')))
+            prompt.assert_not_called()
 
 
 class CompatibilityTests(unittest.TestCase):

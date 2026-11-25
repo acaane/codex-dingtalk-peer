@@ -62,10 +62,11 @@ class AutoPublicationTests(unittest.TestCase):
         self.drivers.append(driver)
         return driver
 
-    def automatic(self):
+    def automatic(self, target="ALL"):
         expected = update.publication_candidate(self.root)["candidate"]
         with redirect_stdout(io.StringIO()):
-            return update.publish(self.root, self.config, {"id": "A"}, self.transport, automatic=True, expected_candidate=expected)
+            return update.publish(self.root, self.config, {"id": "A"}, self.transport, target=target,
+                                  automatic=True, expected_candidate=expected)
 
     def manual(self):
         with redirect_stdout(io.StringIO()):
@@ -84,6 +85,25 @@ class AutoPublicationTests(unittest.TestCase):
         self.assertEqual(manifest["auto_candidate"], update.publication_candidate(self.root)["candidate"])
         self.assertEqual(self.transport.sent[-1]["kind"], "commit")
         self.assertEqual(update.published_release(self.root, self.config, "A")[0]["id"], manifest["id"])
+
+    def test_reorganized_checkout_works_without_legacy_root_scripts(self):
+        for name in update.LEGACY_OPERATOR_SCRIPTS:
+            (self.root / name).unlink()
+        package = self.root / "tests"
+        package.mkdir()
+        (package / "__init__.py").touch()
+        self.test_file.rename(package / self.test_file.name)
+        self.automatic()
+        self.assertEqual(self.state()["tests"], 1)
+        self.assertEqual(self.transport.sent[-1]["kind"], "commit")
+
+    def test_targeted_release_to_only_other_peer_needs_no_republication(self):
+        self.automatic(target="B")
+        driver = self.driver(quiet=0)
+        with patch.object(update.subprocess, "Popen") as launch:
+            driver.tick(now=0)
+            driver.tick(now=100)
+            launch.assert_not_called()
 
     def test_failed_real_tests_do_not_send_or_loop_on_restart(self):
         self.test_file.write_text('import unittest\nclass Check(unittest.TestCase):\n def test_fail(self): self.fail("fixture failure")\n', encoding="utf-8")

@@ -101,8 +101,8 @@ class InstanceControlTests(unittest.TestCase):
 
     def test_start_race_is_handled_as_existing_instance_without_retrying_launch(self):
         with patch.object(setup_helper, 'follow_existing_connector', side_effect=[None, 0]), \
-                patch.object(setup_helper, 'check_config'), \
-                patch.object(setup_helper, 'load_config', return_value={}), \
+                patch.object(setup_helper, 'check_config', return_value={}), \
+                patch.object(setup_helper, 'prepare_local_codex'), \
                 patch.object(setup_helper, 'business_wake_adapter', return_value='cli'), \
                 patch.object(setup_helper, 'run_supervisor', return_value=20) as launch, \
                 redirect_stdout(io.StringIO()):
