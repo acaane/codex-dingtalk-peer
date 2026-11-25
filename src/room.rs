@@ -166,6 +166,13 @@ pub struct RoomClient {
 }
 
 impl RoomClient {
+    pub fn for_saved_host(directory: &Path, room_id: &str) -> io::Result<Self> {
+        match Sessions::open_existing(directory)?.get::<SavedRoom>(room_id)? {
+            Some(SavedRoom::Host { invite, owner, .. }) => Self::new(&invite, owner),
+            _ => Err(problem("本机没有该房间的主协调端身份")),
+        }
+    }
+
     fn new(invite: &Invite, member: Secret) -> io::Result<Self> {
         let mut roots = RootCertStore::empty();
         roots
@@ -554,7 +561,7 @@ impl ServerRoom {
                         role,
                         task.action,
                         self.readiness.verified_bindings(),
-                        advertised,
+                        advertised.or(task.binding),
                         timestamp,
                     )) {
                         Ok(update) => Some(update),

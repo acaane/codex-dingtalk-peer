@@ -316,12 +316,7 @@ impl RoomView {
                 let task_ready = update.readiness.is_some_and(|ready| {
                     ready.host == Status::Passed && ready.guest == Status::Passed
                 });
-                let binding = update
-                    .task
-                    .as_ref()
-                    .and_then(|task| task.grant)
-                    .and_then(|_| room.agent.read(cx).binding().flatten())
-                    .cloned();
+                let binding = room.agent.read(cx).binding().flatten().cloned();
                 room.tasks.update(cx, |tasks, cx| {
                     tasks.receive(update.task, task_ready, binding, sent_at, window, cx)
                 });

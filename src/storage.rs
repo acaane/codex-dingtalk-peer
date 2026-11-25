@@ -30,6 +30,16 @@ pub(crate) async fn connect(path: &Path) -> sqlx::Result<SqliteConnection> {
     .await
 }
 
+pub(crate) async fn read_only(path: &Path) -> sqlx::Result<SqliteConnection> {
+    SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(path)
+            .read_only(true)
+            .busy_timeout(Duration::from_millis(250)),
+    )
+    .await
+}
+
 pub(crate) fn protect(bytes: &[u8], encrypt: bool) -> io::Result<Vec<u8>> {
     use std::{ptr::null, ptr::null_mut, slice};
     use windows_sys::Win32::{

@@ -1,6 +1,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod agent_binding;
+mod agent_start;
 mod agent_view;
 mod chat;
 mod codex;
@@ -13,7 +14,7 @@ mod task_view;
 mod tasks;
 mod ui;
 
-use std::error::Error;
+use std::{error::Error, process::ExitCode};
 
 use futures_lite::future::block_on;
 use gpui_kit::*;
@@ -27,7 +28,20 @@ async fn open_chat() -> Result<(ChatStore, Vec<Message>), Box<dyn Error>> {
     Ok((store, history))
 }
 
-fn main() {
+fn main() -> ExitCode {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if !args.is_empty() {
+        return match agent_start::command(&args) {
+            Ok(receipt) => {
+                println!("{receipt}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     application().with_assets(assets::Assets).run(|cx| {
         init(cx);
         let options = WindowOptions {
@@ -49,4 +63,5 @@ fn main() {
         })
         .expect("打开 AI 联调台窗口");
     });
+    ExitCode::SUCCESS
 }

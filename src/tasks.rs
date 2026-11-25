@@ -10,19 +10,49 @@ use crate::{
 };
 
 pub const MINUTES: [u64; 3] = [1, 5, 15];
-pub const MAX_GOAL: usize = 4096;
+const MAX_GOAL: usize = 4096;
 const MAX_REPORT: usize = 16 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Action {
-    Submit { id: Id, goal: String, minutes: u64 },
+    Submit(Submission),
     Claim { id: Id, attempt: Id },
     Report(Report),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Submission {
+    pub id: Id,
+    pub goal: String,
+    pub minutes: u64,
+}
+
+impl Submission {
+    pub fn new(goal: &str, minutes: u64) -> io::Result<Self> {
+        let goal = goal.trim();
+        if !valid_goal(goal, minutes) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "请填写联调目标（最多 4096 字节）并选择有效时限",
+            ));
+        }
+        Ok(Self {
+            id: crate::room::random()?,
+            goal: goal.into(),
+            minutes,
+        })
+    }
+}
+
+fn valid_goal(goal: &str, minutes: u64) -> bool {
+    MINUTES.contains(&minutes) && !goal.is_empty() && goal.len() <= MAX_GOAL
 }
 
 #[derive(Serialize, Deserialize)]
 pub struct Request {
     pub action: Option<Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<Secret>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -149,11 +179,11 @@ pub async fn apply(
         save(db, record).await?;
     }
     match action {
-        Some(Action::Submit { id, goal, minutes }) if role == Member::Host => {
+        Some(Action::Submit(Submission { id, goal, minutes })) if role == Member::Host => {
             let goal = goal.trim();
             if load(db, Some(id)).await?.is_some() {
                 update.acknowledged = Some(id);
-            } else if !MINUTES.contains(&minutes) || goal.is_empty() || goal.len() > MAX_GOAL {
+            } else if !valid_goal(goal, minutes) {
                 update.error = Some("请填写有效的目标和截止时间".into());
             } else if latest
                 .as_ref()
@@ -316,12 +346,24 @@ mod tests {
     const ID: Id = [4; 16];
     const ATTEMPT: Id = [5; 16];
 
+    #[test]
+    fn submission_retains_the_existing_wire_shape_and_normalizes_the_goal() {
+        let task = Submission::new("  核对首行\n", 5).unwrap();
+        let json = serde_json::to_value(Action::Submit(task.clone())).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"Submit": {"id": task.id, "goal": "核对首行", "minutes": 5}})
+        );
+        assert!(Submission::new("   ", 5).is_err());
+        assert!(Submission::new("核对首行", 2).is_err());
+    }
+
     fn submission() -> Action {
-        Action::Submit {
+        Action::Submit(Submission {
             id: ID,
             goal: "核对测试接口返回字段".into(),
             minutes: 1,
-        }
+        })
     }
 
     async fn exchange(
@@ -458,11 +500,11 @@ mod tests {
             exchange(
                 &mut db,
                 Member::Host,
-                Some(Action::Submit {
+                Some(Action::Submit(Submission {
                     id: next,
                     goal: "另一项检查".into(),
                     minutes: 1,
-                }),
+                })),
                 81,
             )
             .await;

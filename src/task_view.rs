@@ -15,11 +15,12 @@ use gpui_kit::{prelude::FluentBuilder, *};
 
 use crate::{
     agent_binding::Binding,
+    agent_start::{self, Plan},
     codex,
     readiness::{Failure, Id},
     room::{self, Member, Secret},
     storage,
-    tasks::{self, Action, Grant, Phase, Report, Task as RoomTask, Update},
+    tasks::{self, Action, Grant, Phase, Report, Submission, Task as RoomTask, Update},
 };
 
 struct Claim {
@@ -35,7 +36,10 @@ pub struct TaskView {
     goal: Entity<TextareaState>,
     minutes: u64,
     latest: Option<RoomTask>,
-    pending: Option<Action>,
+    pending: Option<Submission>,
+    binding: Option<Secret>,
+    plan: Option<Plan>,
+    plan_busy: bool,
     claim: Option<Claim>,
     reports: VecDeque<Report>,
     next_outbox_read: Instant,
@@ -62,6 +66,9 @@ impl TaskView {
             minutes: 5,
             latest: None,
             pending: None,
+            binding: None,
+            plan: None,
+            plan_busy: member == Member::Host,
             claim: None,
             reports: VecDeque::new(),
             next_outbox_read: Instant::now(),
@@ -71,8 +78,29 @@ impl TaskView {
         };
         if member == Member::Guest {
             view.read_outbox(cx);
+        } else {
+            view.read_plan(cx);
         }
         view
+    }
+
+    fn read_plan(&self, cx: &mut Context<Self>) {
+        let room = self.room_id.clone();
+        let load = cx
+            .background_executor()
+            .spawn(async move { Plan::load(&storage::data_directory()?, &room).await });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            let _ = this.update(cx, |view, cx| {
+                view.plan_busy = false;
+                match result {
+                    Ok(plan) => view.plan = plan,
+                    Err(error) => view.notice = Some(format!("读取联调登记失败。{error}").into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn read_outbox(&mut self, cx: &mut Context<Self>) {
@@ -102,13 +130,16 @@ impl TaskView {
 
     pub fn request(&mut self, binding: Option<Secret>) -> tasks::Request {
         let action = if self.member == Member::Host {
-            self.pending.clone()
+            self.pending.clone().map(Action::Submit)
         } else if let Some(report) = self.reports.front() {
             Some(Action::Report(report.clone()))
         } else {
             self.claim_action(binding)
         };
-        tasks::Request { action }
+        tasks::Request {
+            action,
+            binding: None,
+        }
     }
 
     fn claim_action(&mut self, binding: Option<Secret>) -> Option<Action> {
@@ -153,9 +184,11 @@ impl TaskView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let changed = !self.connected || self.ready != ready;
+        let fingerprint = binding.as_ref().map(Binding::fingerprint);
+        let changed = !self.connected || self.ready != ready || self.binding != fingerprint;
         self.connected = true;
         self.ready = ready;
+        self.binding = fingerprint;
         let Some(update) = update else {
             if changed {
                 cx.notify();
@@ -172,7 +205,11 @@ impl TaskView {
             cx.notify();
         }
         if let Some(id) = update.acknowledged {
-            if matches!(self.pending, Some(Action::Submit { id: pending, .. }) if pending == id) {
+            if self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.id == id)
+            {
                 self.pending = None;
                 self.notice = None;
                 self.goal
@@ -267,6 +304,7 @@ impl TaskView {
     fn can_submit(&self) -> bool {
         self.connected
             && self.ready
+            && !self.plan_busy
             && self.pending.is_none()
             && self.latest.as_ref().is_none_or(|task| !task.phase.active())
     }
@@ -275,22 +313,88 @@ impl TaskView {
         if !self.can_submit() {
             return;
         }
-        let goal = self.goal.read(cx).value().trim().to_owned();
-        if goal.is_empty() || goal.len() > tasks::MAX_GOAL {
-            self.notice = Some("请填写联调目标，最多 4096 字节".into());
-        } else {
-            match room::random() {
-                Ok(id) => {
-                    self.pending = Some(Action::Submit {
-                        id,
-                        goal,
-                        minutes: self.minutes,
-                    });
-                    self.notice = Some("等待主机确认任务".into());
-                }
-                Err(error) => self.notice = Some(error.to_string().into()),
+        let value = self.goal.read(cx).value();
+        let goal = value.trim();
+        let submission = self
+            .active_plan()
+            .filter(|plan| plan.submission.goal == goal && plan.submission.minutes == self.minutes)
+            .map(|plan| Ok(plan.submission.clone()))
+            .unwrap_or_else(|| Submission::new(goal, self.minutes));
+        match submission {
+            Ok(submission) => {
+                self.pending = Some(submission);
+                self.notice = Some("等待主机确认任务".into());
             }
+            Err(error) => self.notice = Some(error.to_string().into()),
         }
+        cx.notify();
+    }
+
+    fn active_plan(&self) -> Option<&Plan> {
+        self.plan
+            .as_ref()
+            .filter(|plan| Some(plan.binding) == self.binding)
+    }
+
+    fn can_register(&self) -> bool {
+        self.member == Member::Host
+            && self.binding.is_some()
+            && !self.plan_busy
+            && self.pending.is_none()
+    }
+
+    fn register(&mut self, cx: &mut Context<Self>) {
+        let Some(binding) = self.binding.filter(|_| self.can_register()) else {
+            return;
+        };
+        let submission = match Submission::new(self.goal.read(cx).value().as_ref(), self.minutes) {
+            Ok(submission) => submission,
+            Err(error) => {
+                self.notice = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        let plan = Plan {
+            submission,
+            binding,
+        };
+        self.plan_busy = true;
+        let room = self.room_id.clone();
+        let save = cx.background_executor().spawn(async move {
+            plan.save(&storage::data_directory()?, &room).await?;
+            Ok::<_, std::io::Error>(plan)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = save.await;
+            let _ = this.update(cx, |view, cx| {
+                view.plan_busy = false;
+                match result {
+                    Ok(plan) => {
+                        view.plan = Some(plan);
+                        view.notice =
+                            Some("已登记开始联调。可复制启动说明给绑定的 Codex 会话。".into());
+                    }
+                    Err(error) => view.notice = Some(format!("登记失败。{error}").into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn copy_start_instructions(&mut self, cx: &mut Context<Self>) {
+        if self.active_plan().is_none() {
+            return;
+        }
+        self.notice = Some(match agent_start::instructions(&self.room_id) {
+            Ok(instructions) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(instructions));
+                "启动说明已复制。请粘贴到主协调端绑定的 Codex 会话。".into()
+            }
+            Err(error) => error.to_string().into(),
+        });
         cx.notify();
     }
 }
@@ -382,6 +486,41 @@ impl Render for TaskView {
                         .disabled(!self.can_submit())
                         .on_click(cx.listener(|view, _, _, cx| view.submit(cx))),
                 )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("register-agent-start")
+                                .label("登记「开始联调」")
+                                .disabled(!self.can_register())
+                                .on_click(cx.listener(|view, _, _, cx| view.register(cx))),
+                        )
+                        .when(self.active_plan().is_some(), |view| {
+                            view.child(
+                                Button::new("copy-agent-start")
+                                    .label("复制 agent 启动说明")
+                                    .disabled(self.plan_busy)
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.copy_start_instructions(cx)
+                                    })),
+                            )
+                        }),
+                )
+                .when_some(self.plan.as_ref(), |view, plan| {
+                    view.child(
+                        Label::new(if self.active_plan().is_some() {
+                            format!(
+                                "已登记目标 · {}（{} 分钟）",
+                                plan.submission.goal, plan.submission.minutes
+                            )
+                        } else {
+                            "本轮主协调会话尚未匹配已登记目标".into()
+                        })
+                        .text_sm(),
+                    )
+                })
             })
             .when_some(self.notice.clone(), |view, notice| {
                 view.child(Label::new(notice).text_sm())

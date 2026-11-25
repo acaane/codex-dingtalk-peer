@@ -25,6 +25,11 @@ impl Binding {
         Self::load_from(&mut db, room_id).await
     }
 
+    pub async fn read_existing(directory: &Path, room_id: &str) -> sqlx::Result<Option<Self>> {
+        let mut db = storage::read_only(&directory.join("agent-bindings.sqlite3")).await?;
+        Self::load_from(&mut db, room_id).await
+    }
+
     pub async fn save(&self, directory: &Path, room_id: &str) -> sqlx::Result<()> {
         let mut db = open_bindings(directory).await?;
         let mut transaction = db.begin().await?;
