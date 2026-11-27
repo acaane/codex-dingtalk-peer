@@ -32,7 +32,7 @@ const SERVER_NAME: &str = "codex-room.local";
 const INVITE_PREFIX: &str = "cdp-room-1.";
 const INVITE_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-const FILE_TIMEOUT: Duration = Duration::from_secs(15);
+const FILE_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_FRAME: usize = 512 * 1024;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 
@@ -267,13 +267,15 @@ impl RoomClient {
     }
 
     fn request(&self, request: Request) -> io::Result<Reply> {
-        let mut stream = self.connect(REQUEST_TIMEOUT)?;
+        let mut stream = self.connect()?;
         write_frame(&mut stream, &request)?;
         read_reply(&mut stream)
     }
 
     pub fn upload(&self, file: &Upload) -> io::Result<()> {
-        let mut stream = self.connect(FILE_TIMEOUT)?;
+        let mut input = file.open()?;
+        let mut stream = self.connect()?;
+        stream.sock.deadline = None;
         write_frame(
             &mut stream,
             &Request::File {
@@ -287,7 +289,7 @@ impl RoomClient {
         if !matches!(read_reply(&mut stream)?, Reply::ReadyForFile) {
             return Err(problem("主机未确认可接收附件"));
         }
-        stream.write_all(&file.bytes)?;
+        room_files::copy_exact(&mut input, &mut stream, file.info.size)?;
         stream.flush()?;
         match read_reply(&mut stream)? {
             Reply::FileStored => Ok(()),
@@ -295,11 +297,12 @@ impl RoomClient {
         }
     }
 
-    pub fn download(&self, message_id: i64, file: &FileInfo) -> io::Result<Vec<u8>> {
+    pub fn download(&self, message_id: i64, file: &FileInfo, path: &Path) -> io::Result<()> {
         if !file.valid() {
             return Err(problem("附件名称或大小无效"));
         }
-        let mut stream = self.connect(FILE_TIMEOUT)?;
+        let mut stream = self.connect()?;
+        stream.sock.deadline = None;
         write_frame(
             &mut stream,
             &Request::File {
@@ -313,13 +316,11 @@ impl RoomClient {
         if size != file.size {
             return Err(problem("附件大小与聊天记录不符"));
         }
-        let mut bytes = vec![0; size as usize];
-        stream.read_exact(&mut bytes)?;
-        Ok(bytes)
+        room_files::save_to(path, &mut stream, size)
     }
 
-    fn connect(&self, timeout: Duration) -> io::Result<StreamOwned<ClientConnection, TimedSocket>> {
-        let deadline = Instant::now() + timeout;
+    fn connect(&self) -> io::Result<StreamOwned<ClientConnection, TimedSocket>> {
+        let deadline = Some(Instant::now() + REQUEST_TIMEOUT);
         let socket = TcpStream::connect_timeout(&self.address.into(), REQUEST_TIMEOUT)?;
         let name = ServerName::try_from(SERVER_NAME).map_err(other)?;
         let conn = ClientConnection::new(self.tls.clone(), name).map_err(other)?;
@@ -565,7 +566,7 @@ impl ServerRoom {
             conn,
             TimedSocket {
                 socket,
-                deadline: Instant::now() + REQUEST_TIMEOUT,
+                deadline: Some(Instant::now() + REQUEST_TIMEOUT),
             },
         );
         let request = read_frame(&mut stream)?;
@@ -587,7 +588,7 @@ impl ServerRoom {
                 );
             }
             // File I/O uses one bounded worker so slow transfers do not block room polling.
-            stream.sock.deadline = Instant::now() + FILE_TIMEOUT;
+            stream.sock.deadline = None;
             let database = self.database.clone();
             let flag = stop.clone();
             self.file_worker = Some(std::thread::Builder::new().name("room-file".into()).spawn(
@@ -741,16 +742,16 @@ fn transfer_file(
             if !info.valid() {
                 return write_frame(
                     stream,
-                    &Reply::Rejected("文件名无效，或文件超过 5 MiB".into()),
+                    &Reply::Rejected("文件名无效，或文件超过 1 GB".into()),
                 );
             }
             write_frame(stream, &Reply::ReadyForFile)?;
-            let mut data = vec![0; info.size as usize];
-            stream.read_exact(&mut data)?;
+            let staged = room_files::receive(database, stream, info.size)?;
             if stop.load(Ordering::Relaxed) {
                 return write_frame(stream, &Reply::Rejected("主协调端已离开房间".into()));
             }
-            let reply = match block_on(room_files::store(database, role.number(), id, info, data)) {
+            let reply = match block_on(room_files::store(database, role.number(), id, info, staged))
+            {
                 Ok(true) => Reply::FileStored,
                 Ok(false) => Reply::Rejected("该发送编号已用于不同内容".into()),
                 Err(_) => Reply::Rejected("主机暂时无法保存附件，请重试".into()),
@@ -758,8 +759,8 @@ fn transfer_file(
             write_frame(stream, &reply)
         }
         FileOperation::Download { message_id } => {
-            let bytes = match block_on(room_files::read(database, message_id)) {
-                Ok(Some(bytes)) => bytes,
+            let (size, mut source) = match block_on(room_files::read(database, message_id)) {
+                Ok(Some(file)) => file,
                 Ok(None) => {
                     return write_frame(stream, &Reply::Rejected("本房间没有该附件".into()));
                 }
@@ -767,8 +768,8 @@ fn transfer_file(
                     return write_frame(stream, &Reply::Rejected("主机暂时无法读取附件".into()));
                 }
             };
-            write_frame(stream, &Reply::FileBytes(bytes.len() as u32))?;
-            stream.write_all(&bytes)?;
+            write_frame(stream, &Reply::FileBytes(size))?;
+            room_files::copy_exact(&mut source, stream, size)?;
             stream.flush()
         }
     }
@@ -839,8 +840,10 @@ async fn exchange_room(
     };
     let rows = sqlx::query_as::<_, (i64, i64, String, String, Option<String>, Option<u32>)>(
         "SELECT id, author, body, strftime('%Y-%m-%d %H:%M', sent_at, 'unixepoch', 'localtime'),
-             room_files.name, length(room_files.data)
+             COALESCE(room_file_streams.name, room_files.name),
+             COALESCE(room_file_streams.size, length(room_files.data))
          FROM room_messages LEFT JOIN room_files ON room_files.message_id = room_messages.id
+         LEFT JOIN room_file_streams ON room_file_streams.message_id = room_messages.id
          WHERE id > ?1 ORDER BY id LIMIT 8",
     )
     .bind(after)
@@ -933,12 +936,15 @@ fn write_frame<T: Serialize>(stream: &mut impl Write, value: &T) -> io::Result<(
 
 struct TimedSocket {
     socket: TcpStream,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 impl TimedSocket {
     fn timeout(&self) -> io::Result<Duration> {
-        self.deadline
+        let Some(deadline) = self.deadline else {
+            return Ok(FILE_IDLE_TIMEOUT);
+        };
+        deadline
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
             .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "房间连接超时"))
@@ -1175,13 +1181,13 @@ mod tests {
             .map(|n| (n % 251) as u8)
             .collect::<Vec<_>>();
         std::fs::write(&source, &bytes).unwrap();
-        let upload = Upload::read(&source).unwrap();
+        let upload = Upload::select(source).unwrap();
         let host = RoomConnection::create(Ipv4Addr::LOCALHOST, owner_data.path()).unwrap();
         let code = &host.host.as_ref().unwrap().1;
         let invite = Invite::decode(code).unwrap();
         let guest = RoomConnection::join(code, guest_data.path()).unwrap();
 
-        let mut interrupted = guest.client.connect(FILE_TIMEOUT).unwrap();
+        let mut interrupted = guest.client.connect().unwrap();
         write_frame(
             &mut interrupted,
             &Request::File {
@@ -1197,7 +1203,7 @@ mod tests {
             read_reply(&mut interrupted).unwrap(),
             Reply::ReadyForFile
         ));
-        interrupted.write_all(&upload.bytes[..100]).unwrap();
+        interrupted.write_all(&bytes[..100]).unwrap();
         interrupted.flush().unwrap();
         // The room continues to exchange messages while the upload waits for bytes.
         assert!(
@@ -1229,7 +1235,9 @@ mod tests {
             1
         );
         let stranger = RoomClient::new(&invite, random().unwrap()).unwrap();
-        assert!(stranger.download(message.id, info).is_err());
+        let destination = owner_data.path().join("另存 副本.bin");
+        assert!(stranger.download(message.id, info, &destination).is_err());
+        assert!(!destination.exists());
 
         drop(host);
         let deadline = Instant::now() + REQUEST_TIMEOUT;
@@ -1239,11 +1247,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         let resumed = RoomConnection::resume(owner_data.path(), None).unwrap();
-        let read_back = resumed.client.download(message.id, info).unwrap();
-        assert_eq!(read_back, bytes);
-        let destination = owner_data.path().join("另存 副本.bin");
-        room_files::save_to(&destination, &read_back).unwrap();
-        assert!(room_files::save_to(&destination, b"don't replace").is_err());
+        resumed
+            .client
+            .download(message.id, info, &destination)
+            .unwrap();
+        assert!(room_files::save_to(&destination, &mut &b"don't replace"[..], 13).is_err());
         assert_eq!(std::fs::read(&destination).unwrap(), bytes);
     }
 }

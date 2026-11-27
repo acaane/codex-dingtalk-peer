@@ -1,36 +1,70 @@
-use std::{io, path::PathBuf, sync::Arc};
+use std::{collections::HashSet, io, path::PathBuf};
 
-use gpui_kit::component::{Disableable, button::Button, label::Label};
+use gpui_kit::component::{ActiveTheme, Disableable, button::Button, label::Label};
 use gpui_kit::{prelude::FluentBuilder, *};
 
 use crate::{
     room::RoomClient,
-    room_files::{self, FileInfo, Upload},
+    room_files::{FileInfo, LocalSaves, Upload},
 };
 
-enum UploadSource {
-    Selected(PathBuf),
-    Retry(Arc<Upload>),
-}
-
 pub struct FileView {
+    room_id: String,
     client: RoomClient,
     busy: bool,
-    retry: Option<Arc<Upload>>,
+    draft: Option<Upload>,
+    saved: HashSet<i64>,
+    directory: Option<PathBuf>,
     notice: Option<SharedString>,
 }
 
 impl FileView {
-    pub fn new(client: RoomClient) -> Self {
+    pub fn new(client: RoomClient, room_id: String, cx: &mut Context<Self>) -> Self {
+        let loading = room_id.clone();
+        let load = cx
+            .background_executor()
+            .spawn(async move { LocalSaves::load(&loading).await });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            let _ = this.update(cx, |view, cx| {
+                view.busy = false;
+                match result {
+                    Ok(local) => {
+                        view.saved = local.saved;
+                        view.directory = local.directory;
+                    }
+                    Err(error) => {
+                        view.notice = Some(format!("无法读取附件保存记录。{error}").into())
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         Self {
+            room_id,
             client,
-            busy: false,
-            retry: None,
+            busy: true,
+            draft: None,
+            saved: HashSet::new(),
+            directory: None,
             notice: None,
         }
     }
 
-    fn choose(&mut self, cx: &mut Context<Self>) {
+    pub fn has_draft(&self) -> bool {
+        self.draft.is_some()
+    }
+
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    pub fn was_saved(&self, id: i64) -> bool {
+        self.saved.contains(&id)
+    }
+
+    pub fn choose(&mut self, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -42,17 +76,29 @@ impl FileView {
             prompt: Some("选择发送到房间的文件".into()),
         });
         cx.spawn(async move |this, cx| {
-            let selection = selection.await;
+            let result = match selection.await {
+                Ok(Ok(Some(paths))) => {
+                    if let Some(path) = paths.into_iter().next() {
+                        cx.background_executor()
+                            .spawn(async move { Upload::select(path) })
+                            .await
+                            .map(Some)
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Ok(Ok(None)) => Ok(None),
+                _ => Err(io::Error::other("无法打开文件选择器")),
+            };
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
-                match selection {
-                    Ok(Ok(Some(paths))) => {
-                        if let Some(path) = paths.into_iter().next() {
-                            view.send(UploadSource::Selected(path), cx);
-                        }
+                match result {
+                    Ok(Some(file)) => {
+                        view.draft = Some(file);
+                        view.notice = None;
                     }
-                    Ok(Ok(None)) => {}
-                    _ => view.notice = Some("无法打开文件选择器".into()),
+                    Ok(None) => {}
+                    Err(error) => view.notice = Some(error.to_string().into()),
                 }
                 cx.notify();
             });
@@ -61,32 +107,26 @@ impl FileView {
         cx.notify();
     }
 
-    fn send(&mut self, source: UploadSource, cx: &mut Context<Self>) {
+    pub fn send_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.draft.clone().filter(|_| !self.busy) else {
+            return;
+        };
         self.busy = true;
         self.notice = Some("正在发送附件".into());
         let client = self.client.clone();
-        let upload = cx.background_executor().spawn(async move {
-            let file = match source {
-                UploadSource::Selected(path) => Arc::new(Upload::read(&path)?),
-                UploadSource::Retry(file) => file,
-            };
-            let result = client.upload(&file);
-            Ok::<_, io::Error>((file, result))
-        });
+        let upload = cx
+            .background_executor()
+            .spawn(async move { client.upload(&file) });
         cx.spawn(async move |this, cx| {
             let result = upload.await;
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
                 view.notice = Some(match result {
-                    Ok((_, Ok(()))) => {
-                        view.retry = None;
+                    Ok(()) => {
+                        view.draft = None;
                         "附件已发送".into()
                     }
-                    Ok((file, Err(error))) => {
-                        view.retry = Some(file);
-                        format!("附件发送未确认。{error}").into()
-                    }
-                    Err(error) => format!("无法读取要发送的文件。{error}").into(),
+                    Err(error) => format!("附件发送未确认，可再次点击发送。{error}").into(),
                 });
                 cx.notify();
             });
@@ -102,7 +142,12 @@ impl FileView {
         let home = std::env::var_os("USERPROFILE")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        let selection = cx.prompt_for_new_path(&home, Some(&file.name));
+        let directory = self
+            .directory
+            .as_deref()
+            .filter(|path| path.is_dir())
+            .unwrap_or(&home);
+        let selection = cx.prompt_for_new_path(directory, Some(&file.name));
         self.busy = true;
         cx.spawn(async move |this, cx| {
             let selection = selection.await;
@@ -124,21 +169,30 @@ impl FileView {
         self.busy = true;
         self.notice = Some("正在保存附件".into());
         let client = self.client.clone();
+        let room = self.room_id.clone();
         let save = cx.background_executor().spawn(async move {
-            let bytes = client.download(id, &file)?;
-            room_files::save_to(&path, &bytes)
+            client.download(id, &file, &path)?;
+            let directory = path.parent().expect("download has a parent").to_path_buf();
+            let recorded = LocalSaves::record(&room, id, &directory).await;
+            Ok::<_, io::Error>((directory, recorded))
         });
         cx.spawn(async move |this, cx| {
             let result = save.await;
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
-                view.notice = Some(match result {
-                    Ok(()) => "附件已保存".into(),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                        "已有同名文件，请选择其他文件名".into()
+                view.notice = match result {
+                    Ok((directory, recorded)) => {
+                        view.saved.insert(id);
+                        view.directory = Some(directory);
+                        recorded
+                            .err()
+                            .map(|error| format!("附件已保存。无法记录保存目录。{error}").into())
                     }
-                    Err(error) => format!("保存附件失败。{error}").into(),
-                });
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        Some("已有同名文件，请选择其他文件名".into())
+                    }
+                    Err(error) => Some(format!("保存附件失败。{error}").into()),
+                };
                 cx.notify();
             });
         })
@@ -153,32 +207,42 @@ impl Render for FileView {
             .flex()
             .flex_col()
             .gap_2()
+            .when_some(self.draft.as_ref(), |view, file| {
+                let size = f64::from(file.info.size);
+                let size = if size < 1024.0 {
+                    format!("{size:.0} B")
+                } else if size < 1024.0 * 1024.0 {
+                    format!("{:.1} KiB", size / 1024.0)
+                } else {
+                    format!("{:.1} MiB", size / (1024.0 * 1024.0))
+                };
+                view.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_3()
+                        .p_2()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded_lg()
+                        .child(
+                            Label::new(format!("待发送 · {} · {size}", file.info.name)).text_sm(),
+                        )
+                        .child(
+                            Button::new("remove-room-file")
+                                .label("移除附件")
+                                .disabled(self.busy)
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.draft = None;
+                                    view.notice = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
             .when_some(self.notice.clone(), |view, notice| {
                 view.child(Label::new(notice).text_sm())
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        Button::new("send-room-file")
-                            .label("发送文件")
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|view, _, _, cx| view.choose(cx))),
-                    )
-                    .when_some(self.retry.clone(), |view, file| {
-                        view.child(
-                            Button::new("retry-room-file")
-                                .label("重试附件")
-                                .disabled(self.busy)
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    if !view.busy {
-                                        view.send(UploadSource::Retry(file.clone()), cx);
-                                    }
-                                })),
-                        )
-                    }),
-            )
     }
 }
