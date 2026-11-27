@@ -265,7 +265,15 @@ impl RoomView {
         let list = ListState::new(0, ListAlignment::Bottom, px(240.));
         list.set_follow_mode(FollowMode::Tail);
         let agent = cx.new(|cx| AgentView::new(connection.room_id.clone(), cx));
-        let tasks = cx.new(|cx| TaskView::new(connection.room_id, member, window, cx));
+        let tasks = cx.new(|cx| {
+            TaskView::new(
+                connection.room_id,
+                member,
+                connection.client.clone(),
+                window,
+                cx,
+            )
+        });
         self.active = Some(ActiveRoom {
             host: connection.host,
             client: connection.client,
