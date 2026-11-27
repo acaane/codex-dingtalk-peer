@@ -171,9 +171,8 @@ impl Render for ChatWindow {
                         message_row(
                             message.id,
                             true,
-                            &message.body,
+                            Label::new(message.body.clone()).text_sm(),
                             &message.local_time,
-                            None,
                             cx,
                         )
                     })
@@ -234,9 +233,8 @@ impl Render for ChatWindow {
 pub(crate) fn message_row(
     id: i64,
     own: bool,
-    body: &str,
+    content: impl IntoElement,
     meta: &str,
-    action: Option<Button>,
     cx: &App,
 ) -> AnyElement {
     let row = div()
@@ -267,8 +265,7 @@ pub(crate) fn message_row(
                     .text_xs()
                     .text_color(cx.theme().muted_foreground),
             )
-            .child(Label::new(body.to_owned()).text_sm())
-            .children(action),
+            .child(content),
     )
     .into_any_element()
 }

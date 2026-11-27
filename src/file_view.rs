@@ -1,5 +1,6 @@
-use std::{collections::HashSet, io, path::PathBuf};
+use std::{collections::HashMap, io, path::PathBuf};
 
+use gpui_kit::base::StyledExt;
 use gpui_kit::component::{ActiveTheme, Disableable, button::Button, label::Label};
 use gpui_kit::{prelude::FluentBuilder, *};
 
@@ -13,7 +14,7 @@ pub struct FileView {
     client: RoomClient,
     busy: bool,
     draft: Option<Upload>,
-    saved: HashSet<i64>,
+    saved: HashMap<i64, PathBuf>,
     directory: Option<PathBuf>,
     notice: Option<SharedString>,
 }
@@ -46,7 +47,7 @@ impl FileView {
             client,
             busy: true,
             draft: None,
-            saved: HashSet::new(),
+            saved: HashMap::new(),
             directory: None,
             notice: None,
         }
@@ -58,10 +59,6 @@ impl FileView {
 
     pub fn busy(&self) -> bool {
         self.busy
-    }
-
-    pub fn was_saved(&self, id: i64) -> bool {
-        self.saved.contains(&id)
     }
 
     pub fn choose(&mut self, cx: &mut Context<Self>) {
@@ -135,7 +132,7 @@ impl FileView {
         cx.notify();
     }
 
-    pub fn choose_destination(&mut self, id: i64, file: FileInfo, cx: &mut Context<Self>) {
+    fn choose_destination(&mut self, id: i64, file: FileInfo, cx: &mut Context<Self>) {
         if self.busy {
             return;
         }
@@ -182,7 +179,7 @@ impl FileView {
                 view.busy = false;
                 view.notice = match result {
                     Ok((directory, recorded)) => {
-                        view.saved.insert(id);
+                        view.saved.insert(id, directory.clone());
                         view.directory = Some(directory);
                         recorded
                             .err()
@@ -199,6 +196,77 @@ impl FileView {
         .detach();
         cx.notify();
     }
+
+    fn open_saved_folder(&mut self, id: i64, cx: &mut Context<Self>) {
+        if let Some(directory) = self.saved.get(&id).filter(|path| path.is_dir()) {
+            cx.open_with_system(directory);
+        } else {
+            self.notice = Some("找不到该附件的保存目录，可以重新另存".into());
+            cx.notify();
+        }
+    }
+}
+
+fn size_label(bytes: u32) -> String {
+    let size = f64::from(bytes);
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", size / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MiB", size / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GiB", size / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+pub fn attachment_card(files: &Entity<FileView>, id: i64, file: &FileInfo, cx: &App) -> Div {
+    let view = files.read(cx);
+    let saved = view.saved.contains_key(&id);
+    let busy = view.busy;
+    let save = {
+        let files = files.clone();
+        let file = file.clone();
+        Button::new(("save-room-file", id as usize))
+            .label(if saved { "已保存" } else { "保存文件" })
+            .disabled(busy)
+            .on_click(move |_, _, cx| {
+                files.update(cx, |view, cx| view.choose_destination(id, file.clone(), cx));
+            })
+    };
+    div()
+        .flex()
+        .flex_col()
+        .min_w(px(208.))
+        .gap_1()
+        .child(Label::new(file.name.clone()).text_sm().font_semibold())
+        .child(
+            Label::new(size_label(file.size))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .justify_between()
+                .mt_1()
+                .pt_2()
+                .border_t_1()
+                .border_color(cx.theme().border)
+                .child(save)
+                .when(saved, |row| {
+                    let files = files.clone();
+                    row.child(
+                        Button::new(("open-room-file-folder", id as usize))
+                            .label("打开文件夹")
+                            .on_click(move |_, _, cx| {
+                                files.update(cx, |view, cx| view.open_saved_folder(id, cx));
+                            }),
+                    )
+                }),
+        )
 }
 
 impl Render for FileView {
@@ -208,14 +276,7 @@ impl Render for FileView {
             .flex_col()
             .gap_2()
             .when_some(self.draft.as_ref(), |view, file| {
-                let size = f64::from(file.info.size);
-                let size = if size < 1024.0 {
-                    format!("{size:.0} B")
-                } else if size < 1024.0 * 1024.0 {
-                    format!("{:.1} KiB", size / 1024.0)
-                } else {
-                    format!("{:.1} MiB", size / (1024.0 * 1024.0))
-                };
+                let size = size_label(file.info.size);
                 view.child(
                     div()
                         .flex()

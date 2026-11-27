@@ -17,7 +17,7 @@ use crate::{
     agent_binding::Binding,
     agent_view::AgentView,
     codex,
-    file_view::FileView,
+    file_view::{FileView, attachment_card},
     readiness::{self, Id, Status},
     room::{self, Member, Outgoing, RoomClient, RoomConnection, RoomHost, RoomMessage, RoomUpdate},
     room_sessions::Sessions,
@@ -607,25 +607,18 @@ impl RoomView {
         let files = room.files.clone();
         let history = list(room.list.clone(), move |index, _, cx| {
             let message = &messages[index];
-            let attachment = message.file.clone().map(|file| {
-                let files = files.clone();
-                let id = message.id;
-                Button::new(("save-room-file", id as usize))
-                    .label(if files.read(cx).was_saved(id) {
-                        "已保存"
-                    } else {
-                        "保存文件"
-                    })
-                    .on_click(move |_, _, cx| {
-                        files.update(cx, |view, cx| view.choose_destination(id, file.clone(), cx));
-                    })
-            });
+            let content = if let Some(file) = &message.file {
+                attachment_card(&files, message.id, file, cx).into_any_element()
+            } else {
+                Label::new(message.body.clone())
+                    .text_sm()
+                    .into_any_element()
+            };
             crate::ui::message_row(
                 message.id,
                 message.author == member,
-                &message.body,
+                content,
                 &format!("{} · {}", message.author.label(), message.time),
-                attachment,
                 cx,
             )
         })

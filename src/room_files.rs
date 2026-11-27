@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     fs::{self, File},
     io::{self, Cursor, Read, Write},
     path::{Path, PathBuf},
@@ -243,19 +243,20 @@ pub async fn read(path: &Path, id: i64) -> io::Result<Option<(u32, Box<dyn Read>
 }
 
 pub struct LocalSaves {
-    pub saved: HashSet<i64>,
+    pub saved: HashMap<i64, PathBuf>,
     pub directory: Option<PathBuf>,
 }
 
 impl LocalSaves {
     pub async fn load(room: &str) -> io::Result<Self> {
         let mut db = open_local_saves().await?;
-        let saved =
-            sqlx::query_scalar::<_, i64>("SELECT message_id FROM local_saves WHERE room = ?1")
-                .bind(room)
-                .fetch_all(&mut db)
-                .await
-                .map_err(io::Error::other)?;
+        let saved = sqlx::query_as::<_, (i64, String)>(
+            "SELECT message_id, directory FROM local_saves WHERE room = ?1",
+        )
+        .bind(room)
+        .fetch_all(&mut db)
+        .await
+        .map_err(io::Error::other)?;
         let last = sqlx::query_scalar::<_, String>(
             "SELECT directory FROM local_saves ORDER BY saved_order DESC LIMIT 1",
         )
@@ -263,7 +264,10 @@ impl LocalSaves {
         .await
         .map_err(io::Error::other)?;
         Ok(Self {
-            saved: saved.into_iter().collect(),
+            saved: saved
+                .into_iter()
+                .map(|(id, path)| (id, PathBuf::from(path)))
+                .collect(),
             directory: last.map(PathBuf::from),
         })
     }
