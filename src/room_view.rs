@@ -30,6 +30,7 @@ pub struct RoomView {
     invite: Entity<TextareaState>,
     can_resume: bool,
     recent: Option<Vec<RecentRoom>>,
+    setup: Option<RoomSetup>,
     loading_recent: bool,
     composer: Entity<TextareaState>,
     connecting: bool,
@@ -44,6 +45,12 @@ struct RecentRoom {
     project: Option<String>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RoomSetup {
+    Create,
+    Join,
+}
+
 struct ActiveRoom {
     host: Option<(RoomHost, String)>,
     client: RoomClient,
@@ -53,6 +60,7 @@ struct ActiveRoom {
     readiness: Option<readiness::Update>,
     probe: Option<LocalProbe>,
     panel: Panel,
+    show_options: bool,
     member: Member,
     connected: bool,
     guest_joined: bool,
@@ -164,6 +172,7 @@ impl RoomView {
                 .and_then(|directory| Sessions::has_last(&directory))
                 .unwrap_or(false),
             recent: None,
+            setup: None,
             loading_recent: false,
             invite: cx.new(|cx| {
                 TextareaState::new(window, cx)
@@ -182,7 +191,19 @@ impl RoomView {
         }
     }
 
+    pub fn in_room_now(&self) -> bool {
+        self.active.is_some()
+    }
+
+    fn toggle_setup(&mut self, setup: RoomSetup, cx: &mut Context<Self>) {
+        self.recent = None;
+        self.notice = None;
+        self.setup = (self.setup != Some(setup)).then_some(setup);
+        cx.notify();
+    }
+
     fn toggle_recent(&mut self, cx: &mut Context<Self>) {
+        self.setup = None;
         if self.recent.take().is_some() {
             cx.notify();
             return;
@@ -243,6 +264,7 @@ impl RoomView {
                     Ok(connection) => {
                         view.can_resume = true;
                         view.recent = None;
+                        view.setup = None;
                         view.invite
                             .update(cx, |input, cx| input.set_value("", window, cx));
                         view.enter(connection, window, cx);
@@ -267,6 +289,7 @@ impl RoomView {
         let list = ListState::new(0, ListAlignment::Bottom, px(240.));
         list.set_follow_mode(FollowMode::Tail);
         let agent = cx.new(|cx| AgentView::new(connection.room_id.clone(), cx));
+        cx.observe(&agent, |_, _, cx| cx.notify()).detach();
         let files =
             cx.new(|cx| FileView::new(connection.client.clone(), connection.room_id.clone(), cx));
         cx.observe(&files, |_, _, cx| cx.notify()).detach();
@@ -279,6 +302,7 @@ impl RoomView {
                 cx,
             )
         });
+        cx.observe(&tasks, |_, _, cx| cx.notify()).detach();
         self.active = Some(ActiveRoom {
             host: connection.host,
             client: connection.client,
@@ -288,6 +312,7 @@ impl RoomView {
             readiness: None,
             probe: None,
             panel: Panel::Chat,
+            show_options: false,
             member,
             connected: connection.ready,
             guest_joined: member == Member::Guest,
@@ -466,35 +491,53 @@ impl RoomView {
             .flex()
             .flex_col()
             .gap_4()
-            .when(self.can_resume, |view| {
-                view.child(
-                    card().child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap_2()
-                            .child(
-                                Button::new("resume-room")
-                                    .label("继续上次房间")
-                                    .primary()
-                                    .disabled(busy)
-                                    .on_click(cx.listener(|view, _, window, cx| {
-                                        view.connect(ConnectionRequest::Resume(None), window, cx)
-                                    })),
-                            )
-                            .child(
-                                Button::new("recent-rooms")
-                                    .label(if self.recent.is_some() {
-                                        "收起最近联调"
-                                    } else {
-                                        "最近联调"
-                                    })
-                                    .disabled(busy)
-                                    .on_click(cx.listener(|view, _, _, cx| view.toggle_recent(cx))),
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .when(self.can_resume, |row| {
+                        row.child(
+                            Button::new("resume-room")
+                                .label("继续上次联调")
+                                .primary()
+                                .disabled(busy)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    view.connect(ConnectionRequest::Resume(None), window, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("create-integration")
+                            .label("创建联调")
+                            .disabled(busy)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                if let [ip] = view.addresses.as_slice() {
+                                    view.connect(ConnectionRequest::Host(*ip), window, cx);
+                                } else {
+                                    view.toggle_setup(RoomSetup::Create, cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("join-integration")
+                            .label("加入联调")
+                            .disabled(busy)
+                            .on_click(
+                                cx.listener(|view, _, _, cx| {
+                                    view.toggle_setup(RoomSetup::Join, cx)
+                                }),
                             ),
-                    ),
-                )
-            })
+                    )
+                    .when(self.can_resume, |row| {
+                        row.child(
+                            Button::new("recent-rooms")
+                                .label("最近联调")
+                                .disabled(busy)
+                                .on_click(cx.listener(|view, _, _, cx| view.toggle_recent(cx))),
+                        )
+                    }),
+            )
             .when_some(self.recent.as_ref(), |view, rooms| {
                 view.child(
                     card()
@@ -527,63 +570,67 @@ impl RoomView {
                         })),
                 )
             })
-            .child(
-                card()
-                    .child(Label::new("选择主协调电脑的内网地址").text_sm())
-                    .when(self.addresses.is_empty(), |view| {
-                        view.child(Label::new("未检测到内网 IPv4 地址").text_sm())
-                    })
-                    .child(
-                        div().flex().flex_wrap().gap_2().children(
-                            self.addresses
-                                .iter()
-                                .copied()
-                                .enumerate()
-                                .map(|(index, ip)| {
-                                    let button = Button::new(("address", index))
-                                        .label(ip.to_string())
-                                        .disabled(busy);
-                                    let button = if self.selected == Some(ip) {
-                                        button.primary()
-                                    } else {
-                                        button
-                                    };
-                                    button.on_click(cx.listener(move |view, _, _, cx| {
-                                        view.selected = Some(ip);
-                                        cx.notify();
-                                    }))
-                                }),
+            .when(self.setup == Some(RoomSetup::Create), |view| {
+                view.child(
+                    card()
+                        .child(Label::new("选择同事可以访问的内网地址").text_sm())
+                        .when(self.addresses.is_empty(), |view| {
+                            view.child(Label::new("未检测到内网 IPv4 地址").text_sm())
+                        })
+                        .child(
+                            div().flex().flex_wrap().gap_2().children(
+                                self.addresses
+                                    .iter()
+                                    .copied()
+                                    .enumerate()
+                                    .map(|(index, ip)| {
+                                        let button = Button::new(("address", index))
+                                            .label(ip.to_string())
+                                            .disabled(busy);
+                                        let button = if self.selected == Some(ip) {
+                                            button.primary()
+                                        } else {
+                                            button
+                                        };
+                                        button.on_click(cx.listener(move |view, _, _, cx| {
+                                            view.selected = Some(ip);
+                                            cx.notify();
+                                        }))
+                                    }),
+                            ),
+                        )
+                        .child(
+                            Button::new("create-room")
+                                .label("创建房间")
+                                .primary()
+                                .disabled(self.selected.is_none() || busy)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    if let Some(ip) = view.selected {
+                                        view.connect(ConnectionRequest::Host(ip), window, cx);
+                                    }
+                                })),
                         ),
-                    )
-                    .child(
-                        Button::new("create-room")
-                            .label("创建房间")
-                            .primary()
-                            .disabled(self.selected.is_none() || busy)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                if let Some(ip) = view.selected {
-                                    view.connect(ConnectionRequest::Host(ip), window, cx);
-                                }
-                            })),
-                    ),
-            )
-            .child(
-                card()
-                    .child(
-                        Textarea::new(&self.invite)
-                            .aria_label("房间邀请")
-                            .disabled(busy),
-                    )
-                    .child(
-                        Button::new("join-room")
-                            .label("加入房间")
-                            .disabled(busy)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                let code = view.invite.read(cx).value().trim().to_owned();
-                                view.connect(ConnectionRequest::Join(code), window, cx);
-                            })),
-                    ),
-            )
+                )
+            })
+            .when(self.setup == Some(RoomSetup::Join), |view| {
+                view.child(
+                    card()
+                        .child(
+                            Textarea::new(&self.invite)
+                                .aria_label("房间邀请")
+                                .disabled(busy),
+                        )
+                        .child(
+                            Button::new("join-room")
+                                .label("加入房间")
+                                .disabled(busy)
+                                .on_click(cx.listener(|view, _, window, cx| {
+                                    let code = view.invite.read(cx).value().trim().to_owned();
+                                    view.connect(ConnectionRequest::Join(code), window, cx);
+                                })),
+                        ),
+                )
+            })
             .when(self.connecting, |view| {
                 view.child(Label::new("正在连接房间").text_sm())
             })
@@ -631,10 +678,19 @@ impl RoomView {
         } else {
             "房间已连接"
         };
+        let agent = room.agent.read(cx);
+        let bound = agent.binding().flatten().is_some();
+        let chat = room.panel == Panel::Chat;
+        let ready = room.connected
+            && room.readiness.is_some_and(|update| {
+                update.host == Status::Passed && update.guest == Status::Passed
+            });
+        let task_status = room.tasks.read(cx).current_status();
         let header =
             div()
                 .flex()
                 .items_center()
+                .flex_wrap()
                 .gap_3()
                 .px_4()
                 .py_3()
@@ -646,7 +702,7 @@ impl RoomView {
                 .when_some(
                     room.host
                         .as_ref()
-                        .filter(|_| !room.guest_joined)
+                        .filter(|_| chat && !room.guest_joined)
                         .map(|(_, invitation)| invitation.clone()),
                     |view, invitation| {
                         view.child(Button::new("copy-invite").label("复制邀请").on_click(
@@ -660,55 +716,92 @@ impl RoomView {
                         ))
                     },
                 )
-                .child(
-                    Button::new("codex-agent")
-                        .label(if room.panel == Panel::Agent {
-                            "返回房间聊天"
-                        } else {
-                            "Codex 会话"
-                        })
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            let Some(room) = view.active.as_mut() else {
-                                return;
-                            };
-                            room.panel = if room.panel == Panel::Agent {
-                                Panel::Chat
-                            } else {
-                                Panel::Agent
-                            };
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("room-task-panel")
-                        .label(if room.panel == Panel::Tasks {
-                            "返回房间聊天"
-                        } else {
-                            "联调任务"
-                        })
-                        .on_click(cx.listener(|view, _, _, cx| {
-                            if let Some(room) = view.active.as_mut() {
-                                room.panel = if room.panel == Panel::Tasks {
-                                    Panel::Chat
+                .when(chat && !bound, |view| {
+                    view.child(
+                        Button::new("choose-project")
+                            .label("选择工程")
+                            .primary()
+                            .disabled(agent.busy())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let Some(room) = &view.active {
+                                    room.agent
+                                        .update(cx, |agent, cx| agent.choose_project_and_bind(cx));
+                                }
+                            })),
+                    )
+                })
+                .when(
+                    chat && (task_status.is_some() || (ready && member == Member::Host)),
+                    |view| {
+                        view.child(
+                            Button::new("room-task-panel")
+                                .label(if task_status.is_some() {
+                                    "联调任务"
                                 } else {
-                                    Panel::Tasks
-                                };
+                                    "发起联调"
+                                })
+                                .primary()
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Some(room) = view.active.as_mut() {
+                                        room.panel = Panel::Tasks;
+                                        room.show_options = false;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                    },
+                )
+                .when(chat, |view| {
+                    view.child(
+                        Button::new("room-options")
+                            .label("房间选项")
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let Some(room) = view.active.as_mut() {
+                                    room.show_options = !room.show_options;
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                })
+                .when(!chat, |view| {
+                    view.child(Button::new("back-room-chat").label("返回聊天").on_click(
+                        cx.listener(|view, _, _, cx| {
+                            if let Some(room) = view.active.as_mut() {
+                                room.panel = Panel::Chat;
                                 cx.notify();
                             }
-                        })),
-                )
-                .child(
-                    Button::new("leave-room")
-                        .label("离开房间")
-                        .on_click(cx.listener(|view, _, window, cx| {
-                            view.sync = None;
-                            view.active = None;
-                            view.notice = None;
-                            view.composer
-                                .update(cx, |input, cx| input.set_value("", window, cx));
+                        }),
+                    ))
+                });
+        let options = div()
+            .flex()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .bg(background)
+            .child(
+                Button::new("codex-agent")
+                    .label("会话设置")
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        if let Some(room) = view.active.as_mut() {
+                            room.panel = Panel::Agent;
+                            room.show_options = false;
                             cx.notify();
-                        })),
-                );
+                        }
+                    })),
+            )
+            .child(
+                Button::new("leave-room")
+                    .label("离开房间")
+                    .on_click(cx.listener(|view, _, window, cx| {
+                        view.sync = None;
+                        view.active = None;
+                        view.notice = None;
+                        view.composer
+                            .update(cx, |input, cx| input.set_value("", window, cx));
+                        cx.notify();
+                    })),
+            );
         let status = div()
             .flex()
             .items_center()
@@ -719,34 +812,57 @@ impl RoomView {
             .bg(background)
             .border_b_1()
             .border_color(border)
-            .when_some(room.readiness.filter(|_| room.connected), |view, update| {
-                view.child(Label::new(readiness_label(Member::Host, update.host)).text_sm())
-                    .child(Label::new(readiness_label(Member::Guest, update.guest)).text_sm())
-                    .when(matches!(update.status(member), Status::Failed(_)), |view| {
-                        view.child(
-                            Button::new("retry-readiness")
-                                .label("重试本端验证")
-                                .disabled(room.probe.as_ref().is_some_and(|probe| probe.retry))
-                                .on_click(cx.listener(|view, _, _, cx| {
-                                    if let Some(probe) =
-                                        view.active.as_mut().and_then(|room| room.probe.as_mut())
-                                    {
-                                        match room::random() {
-                                            Ok(id) => {
-                                                probe.id = id;
-                                                probe.result = None;
-                                                probe.started = false;
-                                                probe.retry = true;
+            .when(ready, |view| view.child(Label::new("双方已就绪").text_sm()))
+            .when_some(
+                room.readiness.filter(|_| room.connected && !ready),
+                |view, update| {
+                    let local = update.status(member);
+                    view.child(Label::new(readiness_label(member, local)).text_sm())
+                        .when(room.guest_joined, |view| {
+                            let peer = if member == Member::Host {
+                                Member::Guest
+                            } else {
+                                Member::Host
+                            };
+                            view.child(
+                                Label::new(readiness_label(peer, update.status(peer))).text_sm(),
+                            )
+                        })
+                        .when(matches!(local, Status::Failed(_)), |view| {
+                            view.child(
+                                Button::new("retry-readiness")
+                                    .label("重试本端验证")
+                                    .disabled(room.probe.as_ref().is_some_and(|probe| probe.retry))
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        if let Some(probe) = view
+                                            .active
+                                            .as_mut()
+                                            .and_then(|room| room.probe.as_mut())
+                                        {
+                                            match room::random() {
+                                                Ok(id) => {
+                                                    probe.id = id;
+                                                    probe.result = None;
+                                                    probe.started = false;
+                                                    probe.retry = true;
+                                                }
+                                                Err(error) => {
+                                                    view.notice = Some(error.to_string().into())
+                                                }
                                             }
-                                            Err(error) => {
-                                                view.notice = Some(error.to_string().into())
-                                            }
+                                            cx.notify();
                                         }
-                                        cx.notify();
-                                    }
-                                })),
-                        )
-                    })
+                                    })),
+                            )
+                        })
+                },
+            )
+            .when_some(
+                agent.binding_notice().filter(|_| !bound && chat),
+                |view, notice| view.child(Label::new(notice).text_sm()),
+            )
+            .when_some(task_status.filter(|_| chat), |view, status| {
+                view.child(Label::new(status).text_sm())
             });
         let panel = match room.panel {
             Panel::Chat => None,
@@ -824,6 +940,7 @@ impl RoomView {
             .flex()
             .flex_col()
             .child(header)
+            .children(room.show_options.then_some(options))
             .child(status)
             .child(history)
             .child(input)

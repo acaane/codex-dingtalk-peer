@@ -65,6 +65,18 @@ impl AgentView {
         self.binding_loaded.then_some(self.saved.as_ref())
     }
 
+    pub fn binding_notice(&self) -> Option<SharedString> {
+        self.status.clone()
+    }
+
+    pub fn busy(&self) -> bool {
+        self.busy
+    }
+
+    pub fn choose_project_and_bind(&mut self, cx: &mut Context<Self>) {
+        self.choose_project(ProjectAction::Bind, cx);
+    }
+
     fn choose_project(&mut self, action: ProjectAction, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
             directories: true,
@@ -121,9 +133,9 @@ impl AgentView {
             let _ = this.update(cx, |view, cx| {
                 view.busy = false;
                 view.status = match result {
-                    Ok(candidates) if candidates.is_empty() => Some(
-                        "该目录没有可绑定的会话。可通过「选择工程并绑定」创建协调会话。".into(),
-                    ),
+                    Ok(candidates) if candidates.is_empty() => {
+                        Some("该目录没有可绑定的会话。可通过「选择工程」创建协调会话。".into())
+                    }
                     Ok(candidates) => {
                         view.candidates = candidates;
                         None
@@ -207,12 +219,12 @@ impl Render for AgentView {
                     .gap_2()
                     .child(
                         Button::new("choose-project")
-                            .label("选择工程并绑定")
+                            .label("选择工程")
                             .primary()
                             .disabled(self.busy)
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.choose_project(ProjectAction::Bind, cx)
-                            })),
+                            .on_click(
+                                cx.listener(|view, _, _, cx| view.choose_project_and_bind(cx)),
+                            ),
                     )
                     .child(
                         Button::new("choose-existing-session")
