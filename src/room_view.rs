@@ -267,6 +267,9 @@ impl RoomView {
         let list = ListState::new(0, ListAlignment::Bottom, px(240.));
         list.set_follow_mode(FollowMode::Tail);
         let agent = cx.new(|cx| AgentView::new(connection.room_id.clone(), cx));
+        let files =
+            cx.new(|cx| FileView::new(connection.client.clone(), connection.room_id.clone(), cx));
+        cx.observe(&files, |_, _, cx| cx.notify()).detach();
         let tasks = cx.new(|cx| {
             TaskView::new(
                 connection.room_id,
@@ -276,7 +279,6 @@ impl RoomView {
                 cx,
             )
         });
-        let files = cx.new(|_| FileView::new(connection.client.clone()));
         self.active = Some(ActiveRoom {
             host: connection.host,
             client: connection.client,
@@ -419,6 +421,10 @@ impl RoomView {
             return;
         };
         if room.sending || !room.connected {
+            return;
+        }
+        if room.files.read(cx).has_draft() {
+            room.files.update(cx, |view, cx| view.send_draft(cx));
             return;
         }
         if room.pending.is_none() {
@@ -605,7 +611,11 @@ impl RoomView {
                 let files = files.clone();
                 let id = message.id;
                 Button::new(("save-room-file", id as usize))
-                    .label("保存文件")
+                    .label(if files.read(cx).was_saved(id) {
+                        "已保存"
+                    } else {
+                        "保存文件"
+                    })
                     .on_click(move |_, _, cx| {
                         files.update(cx, |view, cx| view.choose_destination(id, file.clone(), cx));
                     })
@@ -760,6 +770,9 @@ impl RoomView {
                 .child(div().flex_1().min_h_0().child(panel))
                 .into_any_element();
         }
+        let file_view = room.files.read(cx);
+        let sending_file = file_view.has_draft();
+        let file_busy = file_view.busy();
         let input = div()
             .flex_none()
             .flex()
@@ -769,6 +782,7 @@ impl RoomView {
             .border_t_1()
             .border_color(border)
             .bg(background)
+            .child(room.files.clone())
             .child(
                 Textarea::new(&self.composer)
                     .aria_label("房间消息")
@@ -786,16 +800,29 @@ impl RoomView {
                     .items_end()
                     .justify_end()
                     .gap_2()
-                    .child(room.files.clone())
+                    .child(
+                        Button::new("choose-room-file")
+                            .label("选择文件")
+                            .disabled(file_busy)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                if let Some(room) = &view.active {
+                                    room.files.update(cx, |view, cx| view.choose(cx));
+                                }
+                            })),
+                    )
                     .child(
                         Button::new("send-room-message")
-                            .label(if room.pending.is_some() && !room.sending {
-                                "重试发送"
-                            } else {
-                                "发送"
-                            })
+                            .label(
+                                if !sending_file && room.pending.is_some() && !room.sending {
+                                    "重试发送"
+                                } else {
+                                    "发送"
+                                },
+                            )
                             .primary()
-                            .disabled(room.sending || !room.connected)
+                            .disabled(
+                                room.sending || !room.connected || (sending_file && file_busy),
+                            )
                             .on_click(cx.listener(|view, _, _, cx| view.send(cx))),
                     ),
             );
