@@ -1,11 +1,12 @@
 use std::{
     io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream},
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    thread::JoinHandle,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -20,14 +21,18 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{Connection, SqliteConnection};
 use subtle::ConstantTimeEq;
 
-use crate::readiness;
-use crate::room_sessions::Sessions;
-use crate::tasks;
+use crate::{
+    readiness,
+    room_files::{self, FileInfo, Upload},
+    room_sessions::Sessions,
+    tasks,
+};
 
 const SERVER_NAME: &str = "codex-room.local";
 const INVITE_PREFIX: &str = "cdp-room-1.";
 const INVITE_LIFETIME: Duration = Duration::from_secs(30 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const FILE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_FRAME: usize = 512 * 1024;
 const MAX_MESSAGE_BYTES: usize = 8 * 1024;
 
@@ -62,6 +67,8 @@ pub struct RoomMessage {
     pub author: Member,
     pub body: String,
     pub time: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<FileInfo>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -138,6 +145,16 @@ enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         task: Option<tasks::Request>,
     },
+    File {
+        member: Secret,
+        operation: FileOperation,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+enum FileOperation {
+    Upload { id: MessageId, info: FileInfo },
+    Download { message_id: i64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -145,6 +162,9 @@ enum Reply {
     Joined,
     Update(RoomUpdate),
     Rejected(String),
+    ReadyForFile,
+    FileStored,
+    FileBytes(u32),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -247,16 +267,63 @@ impl RoomClient {
     }
 
     fn request(&self, request: Request) -> io::Result<Reply> {
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let mut stream = self.connect(REQUEST_TIMEOUT)?;
+        write_frame(&mut stream, &request)?;
+        read_reply(&mut stream)
+    }
+
+    pub fn upload(&self, file: &Upload) -> io::Result<()> {
+        let mut stream = self.connect(FILE_TIMEOUT)?;
+        write_frame(
+            &mut stream,
+            &Request::File {
+                member: self.member,
+                operation: FileOperation::Upload {
+                    id: file.id,
+                    info: file.info.clone(),
+                },
+            },
+        )?;
+        if !matches!(read_reply(&mut stream)?, Reply::ReadyForFile) {
+            return Err(problem("主机未确认可接收附件"));
+        }
+        stream.write_all(&file.bytes)?;
+        stream.flush()?;
+        match read_reply(&mut stream)? {
+            Reply::FileStored => Ok(()),
+            _ => Err(problem("主机未确认已保存附件")),
+        }
+    }
+
+    pub fn download(&self, message_id: i64, file: &FileInfo) -> io::Result<Vec<u8>> {
+        if !file.valid() {
+            return Err(problem("附件名称或大小无效"));
+        }
+        let mut stream = self.connect(FILE_TIMEOUT)?;
+        write_frame(
+            &mut stream,
+            &Request::File {
+                member: self.member,
+                operation: FileOperation::Download { message_id },
+            },
+        )?;
+        let Reply::FileBytes(size) = read_reply(&mut stream)? else {
+            return Err(problem("主机未返回附件"));
+        };
+        if size != file.size {
+            return Err(problem("附件大小与聊天记录不符"));
+        }
+        let mut bytes = vec![0; size as usize];
+        stream.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    fn connect(&self, timeout: Duration) -> io::Result<StreamOwned<ClientConnection, TimedSocket>> {
+        let deadline = Instant::now() + timeout;
         let socket = TcpStream::connect_timeout(&self.address.into(), REQUEST_TIMEOUT)?;
         let name = ServerName::try_from(SERVER_NAME).map_err(other)?;
         let conn = ClientConnection::new(self.tls.clone(), name).map_err(other)?;
-        let mut stream = StreamOwned::new(conn, TimedSocket { socket, deadline });
-        write_frame(&mut stream, &request)?;
-        match read_frame(&mut stream)? {
-            Reply::Rejected(message) => Err(problem(&message)),
-            reply => Ok(reply),
-        }
+        Ok(StreamOwned::new(conn, TimedSocket { socket, deadline }))
     }
 }
 
@@ -421,8 +488,8 @@ impl RoomHost {
         let room_id = invite.room_id();
         let rooms = directory.join("rooms");
         std::fs::create_dir_all(&rooms)?;
-        let mut store =
-            block_on(open_room(&rooms.join(format!("{room_id}.sqlite3")))).map_err(other)?;
+        let database = rooms.join(format!("{room_id}.sqlite3"));
+        let mut store = block_on(open_room(&database)).map_err(other)?;
         let guest = block_on(
             sqlx::query_scalar::<_, Vec<u8>>("SELECT fingerprint FROM room_guest WHERE slot = 1")
                 .fetch_optional(&mut store),
@@ -441,6 +508,8 @@ impl RoomHost {
         let flag = stop.clone();
         let mut room = ServerRoom {
             store,
+            database,
+            file_worker: None,
             owner,
             invitation: invite.token,
             guest,
@@ -474,6 +543,8 @@ impl RoomHost {
 
 struct ServerRoom {
     store: SqliteConnection,
+    database: PathBuf,
+    file_worker: Option<JoinHandle<()>>,
     owner: Secret,
     invitation: Secret,
     guest: Option<Vec<u8>>,
@@ -486,7 +557,7 @@ impl ServerRoom {
         &mut self,
         socket: TcpStream,
         tls: Arc<ServerConfig>,
-        stop: &AtomicBool,
+        stop: &Arc<AtomicBool>,
     ) -> io::Result<()> {
         socket.set_nonblocking(false)?;
         let conn = ServerConnection::new(tls).map_err(other)?;
@@ -501,11 +572,52 @@ impl ServerRoom {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
-        write_frame(&mut stream, &self.handle(request))
+        if let Request::File { member, operation } = request {
+            let Some(role) = self.member_role(&member) else {
+                return write_frame(&mut stream, &Reply::Rejected("尚未加入该房间".into()));
+            };
+            if self
+                .file_worker
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+            {
+                return write_frame(
+                    &mut stream,
+                    &Reply::Rejected("另一附件正在传输，请稍后重试".into()),
+                );
+            }
+            // File I/O uses one bounded worker so slow transfers do not block room polling.
+            stream.sock.deadline = Instant::now() + FILE_TIMEOUT;
+            let database = self.database.clone();
+            let flag = stop.clone();
+            self.file_worker = Some(std::thread::Builder::new().name("room-file".into()).spawn(
+                move || {
+                    let _ = transfer_file(&mut stream, &database, role, operation, &flag);
+                },
+            )?);
+            Ok(())
+        } else {
+            write_frame(&mut stream, &self.handle(request))
+        }
+    }
+
+    fn member_role(&self, member: &Secret) -> Option<Member> {
+        if bool::from(self.owner.ct_eq(member)) {
+            Some(Member::Host)
+        } else if self
+            .guest
+            .as_ref()
+            .is_some_and(|guest| bool::from(guest.ct_eq(digest(&SHA256, member).as_ref())))
+        {
+            Some(Member::Guest)
+        } else {
+            None
+        }
     }
 
     fn handle(&mut self, request: Request) -> Reply {
         match request {
+            Request::File { .. } => unreachable!("file requests are handled by serve"),
             Request::Join { invitation, member } => {
                 if !bool::from(self.invitation.ct_eq(&invitation)) {
                     return Reply::Rejected("邀请无效".into());
@@ -544,16 +656,9 @@ impl ServerRoom {
                 readiness,
                 task,
             } => {
-                let role =
-                    if bool::from(self.owner.ct_eq(&member)) {
-                        Member::Host
-                    } else if self.guest.as_ref().is_some_and(|guest| {
-                        bool::from(guest.ct_eq(digest(&SHA256, &member).as_ref()))
-                    }) {
-                        Member::Guest
-                    } else {
-                        return Reply::Rejected("尚未加入该房间".into());
-                    };
+                let Some(role) = self.member_role(&member) else {
+                    return Reply::Rejected("尚未加入该房间".into());
+                };
                 if after < 0
                     || outgoing.as_ref().is_some_and(|msg| {
                         msg.body.trim().is_empty() || msg.body.len() > MAX_MESSAGE_BYTES
@@ -624,6 +729,51 @@ impl ServerRoom {
     }
 }
 
+fn transfer_file(
+    stream: &mut (impl Read + Write),
+    database: &Path,
+    role: Member,
+    operation: FileOperation,
+    stop: &AtomicBool,
+) -> io::Result<()> {
+    match operation {
+        FileOperation::Upload { id, info } => {
+            if !info.valid() {
+                return write_frame(
+                    stream,
+                    &Reply::Rejected("文件名无效，或文件超过 5 MiB".into()),
+                );
+            }
+            write_frame(stream, &Reply::ReadyForFile)?;
+            let mut data = vec![0; info.size as usize];
+            stream.read_exact(&mut data)?;
+            if stop.load(Ordering::Relaxed) {
+                return write_frame(stream, &Reply::Rejected("主协调端已离开房间".into()));
+            }
+            let reply = match block_on(room_files::store(database, role.number(), id, info, data)) {
+                Ok(true) => Reply::FileStored,
+                Ok(false) => Reply::Rejected("该发送编号已用于不同内容".into()),
+                Err(_) => Reply::Rejected("主机暂时无法保存附件，请重试".into()),
+            };
+            write_frame(stream, &reply)
+        }
+        FileOperation::Download { message_id } => {
+            let bytes = match block_on(room_files::read(database, message_id)) {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => {
+                    return write_frame(stream, &Reply::Rejected("本房间没有该附件".into()));
+                }
+                Err(_) => {
+                    return write_frame(stream, &Reply::Rejected("主机暂时无法读取附件".into()));
+                }
+            };
+            write_frame(stream, &Reply::FileBytes(bytes.len() as u32))?;
+            stream.write_all(&bytes)?;
+            stream.flush()
+        }
+    }
+}
+
 async fn open_room(path: &Path) -> sqlx::Result<SqliteConnection> {
     let mut store = crate::storage::connect(path).await?;
     sqlx::query(
@@ -651,6 +801,7 @@ async fn open_room(path: &Path) -> sqlx::Result<SqliteConnection> {
     )
     .execute(&mut store)
     .await?;
+    room_files::initialize(&mut store).await?;
     tasks::initialize(&mut store).await?;
     Ok(store)
 }
@@ -686,9 +837,11 @@ async fn exchange_room(
     } else {
         false
     };
-    let rows: Vec<(i64, i64, String, String)> = sqlx::query_as(
-        "SELECT id, author, body, strftime('%Y-%m-%d %H:%M', sent_at, 'unixepoch', 'localtime')
-         FROM room_messages WHERE id > ?1 ORDER BY id LIMIT 8",
+    let rows = sqlx::query_as::<_, (i64, i64, String, String, Option<String>, Option<u32>)>(
+        "SELECT id, author, body, strftime('%Y-%m-%d %H:%M', sent_at, 'unixepoch', 'localtime'),
+             room_files.name, length(room_files.data)
+         FROM room_messages LEFT JOIN room_files ON room_files.message_id = room_messages.id
+         WHERE id > ?1 ORDER BY id LIMIT 8",
     )
     .bind(after)
     .fetch_all(&mut *transaction)
@@ -696,7 +849,7 @@ async fn exchange_room(
     transaction.commit().await?;
     let messages = rows
         .into_iter()
-        .map(|(id, author, body, time)| RoomMessage {
+        .map(|(id, author, body, time, name, size)| RoomMessage {
             id,
             author: if author == 0 {
                 Member::Host
@@ -705,6 +858,7 @@ async fn exchange_room(
             },
             body,
             time,
+            file: name.zip(size).map(|(name, size)| FileInfo { name, size }),
         })
         .collect();
     Ok((messages, confirmed))
@@ -758,6 +912,13 @@ fn read_frame<T: DeserializeOwned>(stream: &mut impl Read) -> io::Result<T> {
     let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes)?;
     serde_json::from_slice(&bytes).map_err(other)
+}
+
+fn read_reply(stream: &mut impl Read) -> io::Result<Reply> {
+    match read_frame(stream)? {
+        Reply::Rejected(message) => Err(problem(&message)),
+        reply => Ok(reply),
+    }
 }
 
 fn write_frame<T: Serialize>(stream: &mut impl Write, value: &T) -> io::Result<()> {
@@ -1003,5 +1164,86 @@ mod tests {
             .unwrap()
             .certificate;
         assert!(RoomClient::join(&invite, random().unwrap()).is_err());
+    }
+
+    #[test]
+    fn attachment_retries_have_one_chat_record_and_survive_restart() {
+        let owner_data = tempfile::tempdir().unwrap();
+        let guest_data = tempfile::tempdir().unwrap();
+        let source = guest_data.path().join("联调 截图.bin");
+        let bytes = (0..1024 * 1024)
+            .map(|n| (n % 251) as u8)
+            .collect::<Vec<_>>();
+        std::fs::write(&source, &bytes).unwrap();
+        let upload = Upload::read(&source).unwrap();
+        let host = RoomConnection::create(Ipv4Addr::LOCALHOST, owner_data.path()).unwrap();
+        let code = &host.host.as_ref().unwrap().1;
+        let invite = Invite::decode(code).unwrap();
+        let guest = RoomConnection::join(code, guest_data.path()).unwrap();
+
+        let mut interrupted = guest.client.connect(FILE_TIMEOUT).unwrap();
+        write_frame(
+            &mut interrupted,
+            &Request::File {
+                member: guest.client.member,
+                operation: FileOperation::Upload {
+                    id: upload.id,
+                    info: upload.info.clone(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            read_reply(&mut interrupted).unwrap(),
+            Reply::ReadyForFile
+        ));
+        interrupted.write_all(&upload.bytes[..100]).unwrap();
+        interrupted.flush().unwrap();
+        // The room continues to exchange messages while the upload waits for bytes.
+        assert!(
+            host.client
+                .exchange(0, None, None)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        drop(interrupted);
+        assert!(
+            host.client
+                .exchange(0, None, None)
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+
+        guest.client.upload(&upload).unwrap();
+        let messages = host.client.exchange(0, None, None).unwrap().messages;
+        assert_eq!(messages.len(), 1);
+        let message = &messages[0];
+        let info = message.file.as_ref().unwrap();
+        assert_eq!(info.name, "联调 截图.bin");
+        assert_eq!(info.size as usize, bytes.len());
+        guest.client.upload(&upload).unwrap();
+        assert_eq!(
+            host.client.exchange(0, None, None).unwrap().messages.len(),
+            1
+        );
+        let stranger = RoomClient::new(&invite, random().unwrap()).unwrap();
+        assert!(stranger.download(message.id, info).is_err());
+
+        drop(host);
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        while TcpStream::connect_timeout(&invite.address.into(), Duration::from_millis(50)).is_ok()
+        {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let resumed = RoomConnection::resume(owner_data.path(), None).unwrap();
+        let read_back = resumed.client.download(message.id, info).unwrap();
+        assert_eq!(read_back, bytes);
+        let destination = owner_data.path().join("另存 副本.bin");
+        room_files::save_to(&destination, &read_back).unwrap();
+        assert!(room_files::save_to(&destination, b"don't replace").is_err());
+        assert_eq!(std::fs::read(&destination).unwrap(), bytes);
     }
 }
