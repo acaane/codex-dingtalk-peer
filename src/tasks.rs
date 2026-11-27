@@ -12,12 +12,14 @@ use crate::{
 pub const MINUTES: [u64; 3] = [1, 5, 15];
 const MAX_GOAL: usize = 4096;
 const MAX_REPORT: usize = 16 * 1024;
+const MAX_NEXT_STEP: usize = 2048;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub enum Action {
     Submit(Submission),
     Inspect { id: Id },
     History { id: Option<Id> },
+    SaveNextStep { id: Id, note: String },
     Claim { id: Id, attempt: Id },
     Report(Report),
 }
@@ -93,6 +95,18 @@ impl Phase {
             Self::BindingChanged => "会话已更换。请由主协调端重新派单".into(),
         }
     }
+
+    pub fn resume_hint(&self) -> &'static str {
+        match self {
+            Self::Waiting => "接入端接单后继续执行",
+            Self::Running => "主协调端等待接入端回报",
+            Self::Completed(_) => "主协调端核对回报，确认后续安排",
+            Self::Failed(_) => "接入端按任务状态处理失败原因",
+            Self::Expired => "主协调端确认接入端可接单后再派发",
+            Self::Uncertain => "接入端先核对原 Codex 会话，主协调端确认结果后再安排",
+            Self::BindingChanged => "双方重新通过接单验证，主协调端再安排任务",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -102,6 +116,8 @@ pub struct Task {
     pub deadline: u64,
     pub deadline_label: String,
     pub phase: Phase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_step: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -262,6 +278,7 @@ pub async fn apply(
                         deadline,
                         deadline_label,
                         phase: Phase::Waiting,
+                        next_step: None,
                     },
                     bindings,
                     attempt: None,
@@ -286,6 +303,19 @@ pub async fn apply(
         Some(Action::History { id }) => {
             update.history = read_history(db, id).await?;
             return Ok(update);
+        }
+        Some(Action::SaveNextStep { id, note }) if role == Member::Host => {
+            let note = note.trim();
+            if note.len() > MAX_NEXT_STEP {
+                update.error = Some("下一步最多为 2048 字节".into());
+            } else if let Some(record) = latest.as_mut().filter(|record| record.task.id == id) {
+                // Tie the note to the task that was visible when editing started.
+                record.task.next_step = (!note.is_empty()).then(|| note.into());
+                save(db, record).await?;
+                update.acknowledged = Some(id);
+            } else {
+                update.error = Some("当前任务已更新，请重新打开检查点".into());
+            }
         }
         Some(Action::Claim { id, attempt }) if role == Member::Guest => {
             if let Some(record) = latest.as_mut().filter(|record| {
@@ -449,6 +479,72 @@ mod tests {
         apply(db, role, command, Some(BINDINGS), Some(binding), now)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn checkpoint_keeps_the_hosts_note_across_deadline_and_late_report() {
+        block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("checkpoint.sqlite3");
+            let mut db = storage::connect(&database).await.unwrap();
+            initialize(&mut db).await.unwrap();
+            exchange(&mut db, Member::Host, Some(submission()), 20).await;
+            exchange(
+                &mut db,
+                Member::Guest,
+                Some(Action::Claim {
+                    id: ID,
+                    attempt: ATTEMPT,
+                }),
+                21,
+            )
+            .await;
+            let save_note = Action::SaveNextStep {
+                id: ID,
+                note: "  复查回报中的接口字段  ".into(),
+            };
+            let rejected = exchange(&mut db, Member::Guest, Some(save_note.clone()), 22).await;
+            assert!(rejected.error.is_some());
+            assert!(rejected.latest.unwrap().next_step.is_none());
+            assert_eq!(
+                exchange(&mut db, Member::Host, Some(save_note), 22)
+                    .await
+                    .acknowledged,
+                Some(ID)
+            );
+            db.close().await.unwrap();
+
+            let mut db = storage::connect(&database).await.unwrap();
+            let overdue = exchange(&mut db, Member::Host, None, 80)
+                .await
+                .latest
+                .unwrap();
+            assert_eq!(overdue.phase, Phase::Uncertain);
+            assert_eq!(overdue.next_step.as_deref(), Some("复查回报中的接口字段"));
+            let late_report = Action::Report(Report {
+                id: ID,
+                attempt: ATTEMPT,
+                outcome: Ok("接入端断线后回报".into()),
+            });
+            let finished = exchange(&mut db, Member::Guest, Some(late_report), 83)
+                .await
+                .latest
+                .unwrap();
+            assert_eq!(finished.phase, Phase::Completed("接入端断线后回报".into()));
+            assert_eq!(finished.next_step, overdue.next_step);
+
+            let next = Submission::new("另一项联调目标", 1).unwrap();
+            exchange(&mut db, Member::Host, Some(Action::Submit(next)), 84).await;
+            let stale = Action::SaveNextStep {
+                id: ID,
+                note: "只能保存到原来看到的任务".into(),
+            };
+            let rejected = exchange(&mut db, Member::Host, Some(stale), 85).await;
+            assert!(rejected.error.is_some());
+            assert!(rejected.latest.unwrap().next_step.is_none());
+            let previous = read_history(&mut db, Some(ID)).await.unwrap().unwrap();
+            assert_eq!(previous.task.next_step, overdue.next_step);
+        });
     }
 
     #[test]
