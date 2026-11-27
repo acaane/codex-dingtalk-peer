@@ -168,7 +168,14 @@ impl Render for ChatWindow {
                     let messages = chat.messages.clone();
                     list(chat.list.clone(), move |index, _, cx| {
                         let message = &messages[index];
-                        message_row(message.id, true, &message.body, &message.local_time, cx)
+                        message_row(
+                            message.id,
+                            true,
+                            &message.body,
+                            &message.local_time,
+                            None,
+                            cx,
+                        )
                     })
                     .flex_1()
                     .min_h_0()
@@ -224,7 +231,14 @@ impl Render for ChatWindow {
     }
 }
 
-pub(crate) fn message_row(id: i64, own: bool, body: &str, meta: &str, cx: &App) -> AnyElement {
+pub(crate) fn message_row(
+    id: i64,
+    own: bool,
+    body: &str,
+    meta: &str,
+    action: Option<Button>,
+    cx: &App,
+) -> AnyElement {
     let row = div()
         .id(("chat-message", id as usize))
         .w_full()
@@ -253,7 +267,8 @@ pub(crate) fn message_row(id: i64, own: bool, body: &str, meta: &str, cx: &App) 
                     .text_xs()
                     .text_color(cx.theme().muted_foreground),
             )
-            .child(Label::new(body.to_owned()).text_sm()),
+            .child(Label::new(body.to_owned()).text_sm())
+            .children(action),
     )
     .into_any_element()
 }

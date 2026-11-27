@@ -17,6 +17,7 @@ use crate::{
     agent_binding::Binding,
     agent_view::AgentView,
     codex,
+    file_view::FileView,
     readiness::{self, Id, Status},
     room::{self, Member, Outgoing, RoomClient, RoomConnection, RoomHost, RoomMessage, RoomUpdate},
     room_sessions::Sessions,
@@ -48,6 +49,7 @@ struct ActiveRoom {
     client: RoomClient,
     agent: Entity<AgentView>,
     tasks: Entity<TaskView>,
+    files: Entity<FileView>,
     readiness: Option<readiness::Update>,
     probe: Option<LocalProbe>,
     panel: Panel,
@@ -274,11 +276,13 @@ impl RoomView {
                 cx,
             )
         });
+        let files = cx.new(|_| FileView::new(connection.client.clone()));
         self.active = Some(ActiveRoom {
             host: connection.host,
             client: connection.client,
             agent,
             tasks,
+            files,
             readiness: None,
             probe: None,
             panel: Panel::Chat,
@@ -594,13 +598,24 @@ impl RoomView {
         let border = cx.theme().border;
         let member = room.member;
         let messages = room.messages.clone();
+        let files = room.files.clone();
         let history = list(room.list.clone(), move |index, _, cx| {
             let message = &messages[index];
+            let attachment = message.file.clone().map(|file| {
+                let files = files.clone();
+                let id = message.id;
+                Button::new(("save-room-file", id as usize))
+                    .label("保存文件")
+                    .on_click(move |_, _, cx| {
+                        files.update(cx, |view, cx| view.choose_destination(id, file.clone(), cx));
+                    })
+            });
             crate::ui::message_row(
                 message.id,
                 message.author == member,
                 &message.body,
                 &format!("{} · {}", message.author.label(), message.time),
+                attachment,
                 cx,
             )
         })
@@ -766,17 +781,23 @@ impl RoomView {
                     .map(|notice| Label::new(notice).text_sm()),
             )
             .child(
-                div().flex().justify_end().child(
-                    Button::new("send-room-message")
-                        .label(if room.pending.is_some() && !room.sending {
-                            "重试发送"
-                        } else {
-                            "发送"
-                        })
-                        .primary()
-                        .disabled(room.sending || !room.connected)
-                        .on_click(cx.listener(|view, _, _, cx| view.send(cx))),
-                ),
+                div()
+                    .flex()
+                    .items_end()
+                    .justify_end()
+                    .gap_2()
+                    .child(room.files.clone())
+                    .child(
+                        Button::new("send-room-message")
+                            .label(if room.pending.is_some() && !room.sending {
+                                "重试发送"
+                            } else {
+                                "发送"
+                            })
+                            .primary()
+                            .disabled(room.sending || !room.connected)
+                            .on_click(cx.listener(|view, _, _, cx| view.send(cx))),
+                    ),
             );
         div()
             .size_full()
