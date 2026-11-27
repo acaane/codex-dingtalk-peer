@@ -40,6 +40,13 @@ struct HistoryPanel {
     notice: Option<SharedString>,
 }
 
+struct CheckpointPanel {
+    id: Id,
+    draft: Option<Entity<TextareaState>>,
+    saving: bool,
+    notice: Option<SharedString>,
+}
+
 pub struct TaskView {
     room_id: String,
     member: Member,
@@ -48,6 +55,7 @@ pub struct TaskView {
     minutes: u64,
     latest: Option<RoomTask>,
     history: Option<HistoryPanel>,
+    checkpoint: Option<CheckpointPanel>,
     pending: Option<Submission>,
     binding: Option<Secret>,
     plan: Option<Plan>,
@@ -80,6 +88,7 @@ impl TaskView {
             minutes: 5,
             latest: None,
             history: None,
+            checkpoint: None,
             pending: None,
             binding: None,
             plan: None,
@@ -109,20 +118,7 @@ impl TaskView {
         let client = self.client.clone();
         // A separate exchange leaves the normal claim and report polling active.
         let load = cx.background_executor().spawn(async move {
-            client
-                .exchange_room(
-                    i64::MAX,
-                    None,
-                    None,
-                    None,
-                    Some(tasks::Request {
-                        action: Some(Action::History { id }),
-                        binding: None,
-                    }),
-                )?
-                .task
-                .map(|update| update.history)
-                .ok_or_else(|| io::Error::other("主机没有返回任务记录"))
+            task_exchange(&client, Action::History { id }).map(|update| update.history)
         });
         cx.spawn(async move |this, cx| {
             let result = load.await;
@@ -135,6 +131,76 @@ impl TaskView {
                             history.notice = Some(format!("读取任务记录失败。{error}").into())
                         }
                     }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn open_checkpoint(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(task) = self.latest.as_ref() else {
+            return;
+        };
+        let draft = (self.member == Member::Host).then(|| {
+            cx.new(|cx| {
+                let mut input = TextareaState::new(window, cx)
+                    .rows(2)
+                    .placeholder("填写下次联调要处理的事项");
+                if let Some(note) = &task.next_step {
+                    input.set_value(note.clone(), window, cx);
+                }
+                input
+            })
+        });
+        self.checkpoint = Some(CheckpointPanel {
+            id: task.id,
+            draft,
+            saving: false,
+            notice: None,
+        });
+        cx.notify();
+    }
+
+    fn save_next_step(&mut self, cx: &mut Context<Self>) {
+        let Some(checkpoint) = self.checkpoint.as_mut().filter(|checkpoint| {
+            self.connected
+                && !checkpoint.saving
+                && self
+                    .latest
+                    .as_ref()
+                    .is_some_and(|task| task.id == checkpoint.id)
+        }) else {
+            return;
+        };
+        let Some(draft) = &checkpoint.draft else {
+            return;
+        };
+        let id = checkpoint.id;
+        let note = draft.read(cx).value().to_string();
+        checkpoint.saving = true;
+        checkpoint.notice = None;
+        let client = self.client.clone();
+        let save = cx.background_executor().spawn(async move {
+            let update = task_exchange(&client, Action::SaveNextStep { id, note })?;
+            if let Some(error) = update.error {
+                return Err(io::Error::other(error));
+            }
+            if update.acknowledged != Some(id) {
+                return Err(io::Error::other("主机未确认已保存"));
+            }
+            Ok(())
+        });
+        cx.spawn(async move |this, cx| {
+            let result = save.await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(checkpoint) = view.checkpoint.as_mut().filter(|point| point.id == id) {
+                    checkpoint.saving = false;
+                    checkpoint.notice = Some(match result {
+                        Ok(()) => "下一步已保存".into(),
+                        Err(error) => format!("保存下一步失败。{error}").into(),
+                    });
                     cx.notify();
                 }
             });
@@ -458,6 +524,22 @@ impl TaskView {
     }
 }
 
+fn task_exchange(client: &RoomClient, action: Action) -> io::Result<Update> {
+    client
+        .exchange_room(
+            i64::MAX,
+            None,
+            None,
+            None,
+            Some(tasks::Request {
+                action: Some(action),
+                binding: None,
+            }),
+        )?
+        .task
+        .ok_or_else(|| io::Error::other("主机没有返回任务信息"))
+}
+
 fn task_details(view: Stateful<Div>, task: &RoomTask) -> Stateful<Div> {
     view.child(Label::new(task.phase.label()))
         .child(Label::new(format!("任务 ID {}", URL_SAFE_NO_PAD.encode(task.id))).text_sm())
@@ -471,6 +553,9 @@ fn task_details(view: Stateful<Div>, task: &RoomTask) -> Stateful<Div> {
             },
             |view, report| view.child(Label::new(report.clone()).text_sm()),
         )
+        .when_some(task.next_step.as_ref(), |view, note| {
+            view.child(Label::new(format!("下一步 · {note}")).text_sm())
+        })
 }
 
 impl Render for TaskView {
@@ -531,17 +616,68 @@ impl Render for TaskView {
                     |view| view.child(Label::new("本房间暂无任务记录").text_sm()),
                 );
         }
+        if let Some(checkpoint) = &self.checkpoint {
+            let task = self.latest.as_ref().filter(|task| task.id == checkpoint.id);
+            return panel
+                .child(
+                    div().flex().child(
+                        Button::new("back-from-checkpoint")
+                            .label("返回当前任务")
+                            .disabled(checkpoint.saving)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.checkpoint = None;
+                                cx.notify();
+                            })),
+                    ),
+                )
+                .when_some(task, |view, task| {
+                    task_details(view, task).child(Label::new(task.phase.resume_hint()).text_sm())
+                })
+                .when(task.is_none(), |view| {
+                    view.child(Label::new("当前任务已更新，返回后可以打开新的检查点").text_sm())
+                })
+                .when_some(checkpoint.draft.as_ref(), |view, draft| {
+                    view.child(
+                        Textarea::new(draft)
+                            .aria_label("下一步")
+                            .disabled(checkpoint.saving),
+                    )
+                    .child(
+                        div().flex().child(
+                            Button::new("save-next-step")
+                                .label("保存下一步")
+                                .disabled(!self.connected || checkpoint.saving || task.is_none())
+                                .on_click(cx.listener(|view, _, _, cx| view.save_next_step(cx))),
+                        ),
+                    )
+                })
+                .when_some(checkpoint.notice.clone(), |view, notice| {
+                    view.child(Label::new(notice).text_sm())
+                });
+        }
         panel
             .when(!self.connected, |view| {
                 view.child(Label::new("正在等待房间连接").text_sm())
             })
             .child(
-                div().flex().child(
-                    Button::new("task-history")
-                        .label("任务记录")
-                        .disabled(!self.connected)
-                        .on_click(cx.listener(|view, _, _, cx| view.read_history(None, cx))),
-                ),
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new("task-history")
+                            .label("任务记录")
+                            .disabled(!self.connected)
+                            .on_click(cx.listener(|view, _, _, cx| view.read_history(None, cx))),
+                    )
+                    .child(
+                        Button::new("room-checkpoint")
+                            .label("联调检查点")
+                            .disabled(self.latest.is_none())
+                            .on_click(
+                                cx.listener(|view, _, window, cx| view.open_checkpoint(window, cx)),
+                            ),
+                    ),
             )
             .when_some(self.latest.as_ref(), task_details)
             .when(
