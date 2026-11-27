@@ -50,10 +50,11 @@ impl ChatWindow {
             })
             .map_err(|error| format!("无法打开本机聊天记录。{error}").into());
         let room = cx.new(|cx| RoomView::new(window, cx));
+        cx.observe(&room, |_, _, cx| cx.notify()).detach();
         Self {
             opened,
             room,
-            show_room: false,
+            show_room: true,
         }
     }
 
@@ -120,7 +121,7 @@ impl Render for ChatWindow {
             .py_4()
             .child(
                 Label::new(if self.show_room {
-                    "内网房间"
+                    "联调"
                 } else {
                     "本机聊天"
                 })
@@ -133,7 +134,7 @@ impl Render for ChatWindow {
                     .label(if self.show_room {
                         "本机聊天"
                     } else {
-                        "内网房间"
+                        "返回联调"
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.show_room = !this.show_room;
@@ -147,7 +148,7 @@ impl Render for ChatWindow {
                 .flex()
                 .flex_col()
                 .bg(muted)
-                .child(header)
+                .children((!self.room.read(cx).in_room_now()).then_some(header))
                 .child(div().flex_1().min_h_0().child(self.room.clone()));
         }
         let content = match &self.opened {

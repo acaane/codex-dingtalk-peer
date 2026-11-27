@@ -56,6 +56,7 @@ pub struct TaskView {
     latest: Option<RoomTask>,
     history: Option<HistoryPanel>,
     checkpoint: Option<CheckpointPanel>,
+    show_options: bool,
     pending: Option<Submission>,
     binding: Option<Secret>,
     plan: Option<Plan>,
@@ -89,6 +90,7 @@ impl TaskView {
             latest: None,
             history: None,
             checkpoint: None,
+            show_options: false,
             pending: None,
             binding: None,
             plan: None,
@@ -106,6 +108,10 @@ impl TaskView {
             view.read_plan(cx);
         }
         view
+    }
+
+    pub fn current_status(&self) -> Option<String> {
+        self.latest.as_ref().map(|task| task.phase.label())
     }
 
     fn read_history(&mut self, id: Option<Id>, cx: &mut Context<Self>) {
@@ -659,26 +665,6 @@ impl Render for TaskView {
             .when(!self.connected, |view| {
                 view.child(Label::new("正在等待房间连接").text_sm())
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        Button::new("task-history")
-                            .label("任务记录")
-                            .disabled(!self.connected)
-                            .on_click(cx.listener(|view, _, _, cx| view.read_history(None, cx))),
-                    )
-                    .child(
-                        Button::new("room-checkpoint")
-                            .label("联调检查点")
-                            .disabled(self.latest.is_none())
-                            .on_click(
-                                cx.listener(|view, _, window, cx| view.open_checkpoint(window, cx)),
-                            ),
-                    ),
-            )
             .when_some(self.latest.as_ref(), task_details)
             .when(
                 self.member == Member::Guest && self.latest.is_none(),
@@ -694,6 +680,61 @@ impl Render for TaskView {
                         .disabled(self.pending.is_some()),
                 )
                 .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("submit-room-task")
+                                .label("开始联调")
+                                .primary()
+                                .disabled(!self.can_submit())
+                                .on_click(cx.listener(|view, _, _, cx| view.submit(cx))),
+                        )
+                        .child(Label::new(format!("只读 · {} 分钟", self.minutes)).text_sm()),
+                )
+            })
+            .when(
+                self.member == Member::Host || self.latest.is_some(),
+                |panel| {
+                    panel.child(
+                        div().flex().child(
+                            Button::new("task-options")
+                                .label(if self.show_options {
+                                    "收起任务选项"
+                                } else {
+                                    "任务选项"
+                                })
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    view.show_options = !view.show_options;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                },
+            )
+            .when(self.show_options && self.latest.is_some(), |panel| {
+                panel.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("task-history")
+                                .label("任务记录")
+                                .disabled(!self.connected)
+                                .on_click(
+                                    cx.listener(|view, _, _, cx| view.read_history(None, cx)),
+                                ),
+                        )
+                        .child(Button::new("room-checkpoint").label("联调检查点").on_click(
+                            cx.listener(|view, _, window, cx| view.open_checkpoint(window, cx)),
+                        )),
+                )
+            })
+            .when(self.show_options && self.member == Member::Host, |view| {
+                view.child(
                     div()
                         .flex()
                         .items_center()
@@ -715,13 +756,6 @@ impl Render for TaskView {
                                     cx.notify();
                                 }))
                         })),
-                )
-                .child(
-                    Button::new("submit-room-task")
-                        .label("派给接入端（只读）")
-                        .primary()
-                        .disabled(!self.can_submit())
-                        .on_click(cx.listener(|view, _, _, cx| view.submit(cx))),
                 )
                 .child(
                     div()
