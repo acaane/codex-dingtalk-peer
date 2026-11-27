@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    io,
     path::Path,
     time::{Duration, Instant},
 };
@@ -18,9 +19,11 @@ use crate::{
     agent_start::{self, Plan},
     codex,
     readiness::{Failure, Id},
-    room::{self, Member, Secret},
+    room::{self, Member, RoomClient, Secret},
     storage,
-    tasks::{self, Action, Grant, Phase, Report, Submission, Task as RoomTask, Update},
+    tasks::{
+        self, Action, Grant, HistoryEntry, Phase, Report, Submission, Task as RoomTask, Update,
+    },
 };
 
 struct Claim {
@@ -30,12 +33,21 @@ struct Claim {
     started: bool,
 }
 
+#[derive(Default)]
+struct HistoryPanel {
+    entry: Option<HistoryEntry>,
+    loading: bool,
+    notice: Option<SharedString>,
+}
+
 pub struct TaskView {
     room_id: String,
     member: Member,
+    client: RoomClient,
     goal: Entity<TextareaState>,
     minutes: u64,
     latest: Option<RoomTask>,
+    history: Option<HistoryPanel>,
     pending: Option<Submission>,
     binding: Option<Secret>,
     plan: Option<Plan>,
@@ -52,12 +64,14 @@ impl TaskView {
     pub fn new(
         room_id: String,
         member: Member,
+        client: RoomClient,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self {
             room_id,
             member,
+            client,
             goal: cx.new(|cx| {
                 TextareaState::new(window, cx)
                     .rows(4)
@@ -65,6 +79,7 @@ impl TaskView {
             }),
             minutes: 5,
             latest: None,
+            history: None,
             pending: None,
             binding: None,
             plan: None,
@@ -82,6 +97,50 @@ impl TaskView {
             view.read_plan(cx);
         }
         view
+    }
+
+    fn read_history(&mut self, id: Option<Id>, cx: &mut Context<Self>) {
+        let history = self.history.get_or_insert_with(HistoryPanel::default);
+        if history.loading {
+            return;
+        }
+        history.loading = true;
+        history.notice = None;
+        let client = self.client.clone();
+        // A separate exchange leaves the normal claim and report polling active.
+        let load = cx.background_executor().spawn(async move {
+            client
+                .exchange_room(
+                    i64::MAX,
+                    None,
+                    None,
+                    None,
+                    Some(tasks::Request {
+                        action: Some(Action::History { id }),
+                        binding: None,
+                    }),
+                )?
+                .task
+                .map(|update| update.history)
+                .ok_or_else(|| io::Error::other("主机没有返回任务记录"))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = load.await;
+            let _ = this.update(cx, |view, cx| {
+                if let Some(history) = view.history.as_mut() {
+                    history.loading = false;
+                    match result {
+                        Ok(entry) => history.entry = entry,
+                        Err(error) => {
+                            history.notice = Some(format!("读取任务记录失败。{error}").into())
+                        }
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn read_plan(&self, cx: &mut Context<Self>) {
@@ -399,36 +458,92 @@ impl TaskView {
     }
 }
 
+fn task_details(view: Stateful<Div>, task: &RoomTask) -> Stateful<Div> {
+    view.child(Label::new(task.phase.label()))
+        .child(Label::new(format!("任务 ID {}", URL_SAFE_NO_PAD.encode(task.id))).text_sm())
+        .child(Label::new(format!("主机截止时间 {}", task.deadline_label)).text_sm())
+        .child(Label::new(task.goal.clone()).text_sm())
+        .when_some(
+            if let Phase::Completed(report) = &task.phase {
+                Some(report)
+            } else {
+                None
+            },
+            |view, report| view.child(Label::new(report.clone()).text_sm()),
+        )
+}
+
 impl Render for TaskView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let panel = div()
             .id("room-tasks")
             .size_full()
             .overflow_y_scroll()
             .p_5()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_3();
+        if let Some(history) = &self.history {
+            let older = history.entry.as_ref().and_then(|entry| entry.older);
+            let newer = history.entry.as_ref().and_then(|entry| entry.newer);
+            let current = history.entry.as_ref().map(|entry| entry.task.id);
+            return panel
+                .child(
+                    div().flex().flex_wrap().gap_2().children([
+                        Button::new("back-current-task")
+                            .label("返回当前任务")
+                            .disabled(history.loading)
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.history = None;
+                                cx.notify();
+                            })),
+                        Button::new("older-task")
+                            .label("较早一条")
+                            .disabled(history.loading || older.is_none())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.read_history(older, cx);
+                            })),
+                        Button::new("newer-task")
+                            .label("较新一条")
+                            .disabled(history.loading || newer.is_none())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.read_history(newer, cx);
+                            })),
+                        Button::new("refresh-task-record")
+                            .label("刷新记录")
+                            .disabled(history.loading)
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.read_history(current, cx);
+                            })),
+                    ]),
+                )
+                .when(history.loading, |view| {
+                    view.child(Label::new("正在读取任务记录").text_sm())
+                })
+                .when_some(history.notice.clone(), |view, notice| {
+                    view.child(Label::new(notice).text_sm())
+                })
+                .when_some(history.entry.as_ref(), |view, entry| {
+                    task_details(view, &entry.task)
+                })
+                .when(
+                    history.entry.is_none() && !history.loading && history.notice.is_none(),
+                    |view| view.child(Label::new("本房间暂无任务记录").text_sm()),
+                );
+        }
+        panel
             .when(!self.connected, |view| {
                 view.child(Label::new("正在等待房间连接").text_sm())
             })
-            .when_some(self.latest.as_ref(), |view, task| {
-                view.child(Label::new(task.phase.label()))
-                    .child(
-                        Label::new(format!("任务 ID {}", URL_SAFE_NO_PAD.encode(task.id)))
-                            .text_sm(),
-                    )
-                    .child(Label::new(format!("主机截止时间 {}", task.deadline_label)).text_sm())
-                    .child(Label::new(task.goal.clone()).text_sm())
-                    .when_some(
-                        if let Phase::Completed(report) = &task.phase {
-                            Some(report)
-                        } else {
-                            None
-                        },
-                        |view, report| view.child(Label::new(report.clone()).text_sm()),
-                    )
-            })
+            .child(
+                div().flex().child(
+                    Button::new("task-history")
+                        .label("任务记录")
+                        .disabled(!self.connected)
+                        .on_click(cx.listener(|view, _, _, cx| view.read_history(None, cx))),
+                ),
+            )
+            .when_some(self.latest.as_ref(), task_details)
             .when(
                 self.member == Member::Guest && self.latest.is_none(),
                 |view| view.child(Label::new("等待主协调端发起联调").text_sm()),

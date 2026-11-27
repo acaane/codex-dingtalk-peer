@@ -17,6 +17,7 @@ const MAX_REPORT: usize = 16 * 1024;
 pub enum Action {
     Submit(Submission),
     Inspect { id: Id },
+    History { id: Option<Id> },
     Claim { id: Id, attempt: Id },
     Report(Report),
 }
@@ -103,6 +104,13 @@ pub struct Task {
     pub phase: Phase,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub task: Task,
+    pub older: Option<Id>,
+    pub newer: Option<Id>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Grant {
     pub id: Id,
@@ -115,6 +123,8 @@ pub struct Update {
     pub latest: Option<Task>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inspected: Option<Task>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<HistoryEntry>,
     pub acknowledged: Option<Id>,
     pub grant: Option<Grant>,
     pub error: Option<String>,
@@ -152,6 +162,34 @@ async fn load(db: &mut SqliteConnection, id: Option<Id>) -> io::Result<Option<Re
         .map_err(io::Error::other)?
         .map(|data| serde_json::from_slice(&data).map_err(io::Error::other))
         .transpose()
+}
+
+async fn read_history(
+    db: &mut SqliteConnection,
+    id: Option<Id>,
+) -> io::Result<Option<HistoryEntry>> {
+    // Walk insertion order even when a late report updates an older record.
+    let row = sqlx::query_as::<_, (Vec<u8>, Option<Id>, Option<Id>)>(
+        "SELECT current.record,
+             (SELECT id FROM room_tasks WHERE rowid < current.rowid ORDER BY rowid DESC LIMIT 1),
+             (SELECT id FROM room_tasks WHERE rowid > current.rowid ORDER BY rowid ASC LIMIT 1)
+         FROM room_tasks AS current
+         WHERE current.rowid = CASE WHEN ?1 IS NULL THEN (SELECT MAX(rowid) FROM room_tasks)
+             ELSE (SELECT rowid FROM room_tasks WHERE id = ?1) END",
+    )
+    .bind(id)
+    .fetch_optional(db)
+    .await
+    .map_err(io::Error::other)?;
+    row.map(|(data, older, newer)| {
+        let record: Record = serde_json::from_slice(&data).map_err(io::Error::other)?;
+        Ok(HistoryEntry {
+            task: record.task,
+            older,
+            newer,
+        })
+    })
+    .transpose()
 }
 
 async fn save(db: &mut SqliteConnection, record: &Record) -> io::Result<()> {
@@ -243,6 +281,10 @@ pub async fn apply(
                     update.error = Some("当前主协调会话与该任务的登记会话不同".into());
                 }
             }
+            return Ok(update);
+        }
+        Some(Action::History { id }) => {
+            update.history = read_history(db, id).await?;
             return Ok(update);
         }
         Some(Action::Claim { id, attempt }) if role == Member::Guest => {
@@ -407,6 +449,75 @@ mod tests {
         apply(db, role, command, Some(BINDINGS), Some(binding), now)
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn history_keeps_task_order_after_an_older_report_arrives() {
+        block_on(async {
+            let mut db = SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            initialize(&mut db).await.unwrap();
+            let newest = Action::History { id: None };
+            assert!(
+                exchange(&mut db, Member::Host, Some(newest.clone()), 20)
+                    .await
+                    .history
+                    .is_none()
+            );
+
+            exchange(&mut db, Member::Host, Some(submission()), 20).await;
+            exchange(
+                &mut db,
+                Member::Guest,
+                Some(Action::Claim {
+                    id: ID,
+                    attempt: ATTEMPT,
+                }),
+                21,
+            )
+            .await;
+            let next = Submission::new("下一项只读核对", 1).unwrap();
+            let next_id = next.id;
+            exchange(&mut db, Member::Host, Some(Action::Submit(next)), 81).await;
+            exchange(
+                &mut db,
+                Member::Guest,
+                Some(Action::Report(Report {
+                    id: ID,
+                    attempt: ATTEMPT,
+                    outcome: Ok("第一项的离线回报".into()),
+                })),
+                82,
+            )
+            .await;
+
+            let last = exchange(&mut db, Member::Host, Some(newest), 141)
+                .await
+                .history
+                .unwrap();
+            assert_eq!(last.task.id, next_id);
+            assert_eq!(last.task.deadline, 141);
+            assert_eq!(last.task.phase, Phase::Expired);
+            assert_eq!(last.older, Some(ID));
+            assert_eq!(last.newer, None);
+
+            let earlier = exchange(
+                &mut db,
+                Member::Guest,
+                Some(Action::History { id: last.older }),
+                142,
+            )
+            .await
+            .history
+            .unwrap();
+            assert_eq!(earlier.task.id, ID);
+            assert_eq!(earlier.task.deadline, 80);
+            assert_eq!(
+                earlier.task.phase,
+                Phase::Completed("第一项的离线回报".into())
+            );
+            assert_eq!(earlier.older, None);
+            assert_eq!(earlier.newer, Some(next_id));
+        });
     }
 
     #[test]
